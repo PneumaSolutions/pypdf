@@ -208,7 +208,7 @@ class AlgV4:
 
         """
         a = _padding(password)
-        u_hash = hashlib.md5(a)
+        u_hash = hashlib.md5(a, usedforsecurity=False)
         u_hash.update(o_entry)
         u_hash.update(struct.pack("<I", P))
         u_hash.update(id1_entry)
@@ -218,7 +218,7 @@ class AlgV4:
         length = key_size // 8
         if rev >= 3:
             for _ in range(50):
-                u_hash_digest = hashlib.md5(u_hash_digest[:length]).digest()
+                u_hash_digest = hashlib.md5(u_hash_digest[:length], usedforsecurity=False).digest()
         return u_hash_digest[:length]
 
     @staticmethod
@@ -264,11 +264,11 @@ class AlgV4:
 
         """
         a = _padding(owner_password)
-        o_hash_digest = hashlib.md5(a).digest()
+        o_hash_digest = hashlib.md5(a, usedforsecurity=False).digest()
 
         if rev >= 3:
             for _ in range(50):
-                o_hash_digest = hashlib.md5(o_hash_digest).digest()
+                o_hash_digest = hashlib.md5(o_hash_digest, usedforsecurity=False).digest()
 
         return o_hash_digest[: key_size // 8]
 
@@ -346,7 +346,7 @@ class AlgV4:
            invocation of the RC4 function and store the 32-byte result as the
            value of the U entry in the encryption dictionary.
         """
-        u_hash = hashlib.md5(_PADDING)
+        u_hash = hashlib.md5(_PADDING, usedforsecurity=False)
         u_hash.update(id1_entry)
         rc4_enc = rc4_encrypt(key, u_hash.digest())
         for i in range(1, 20):
@@ -1010,7 +1010,7 @@ class Encryption:
         if self.V <= 4:
             n = 5 if self.V == 1 else self.Length // 8
             key_data = key[:n] + pack1 + pack2
-            key_hash = hashlib.md5(key_data)
+            key_hash = hashlib.md5(key_data, usedforsecurity=False)
             rc4_key = key_hash.digest()[: min(n + 5, 16)]
 
             # for AES-128
