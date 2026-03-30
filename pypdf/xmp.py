@@ -19,7 +19,7 @@ from typing import (
 )
 from xml.dom.expatbuilder import ExpatBuilderNS
 from xml.dom.minidom import Document
-from xml.dom.minidom import Element as XmlElement
+from xml.dom.minidom import Attr as XmlAttr, Element as XmlElement
 from xml.dom.xmlbuilder import Options
 from xml.parsers.expat import ExpatError, XMLParserType
 
@@ -358,14 +358,17 @@ class XmpInformation(XmpInformationProtocol, PdfObject):
             return cast(dict[Any, Any], cached)
         retval: dict[Any, Any] = {}
         for element in self.get_element("", namespace, name):
-            alts = element.getElementsByTagNameNS(RDF_NAMESPACE, "Alt")
-            if len(alts):
-                for alt in alts:
-                    for item in alt.getElementsByTagNameNS(RDF_NAMESPACE, "li"):
-                        value = self._get_text(item)
-                        retval[item.getAttribute("xml:lang")] = value
+            if isinstance(element, XmlAttr):
+                retval["x-default"] = element.value
             else:
-                retval["x-default"] = self._get_text(element)
+                alts = element.getElementsByTagNameNS(RDF_NAMESPACE, "Alt")
+                if len(alts):
+                    for alt in alts:
+                        for item in alt.getElementsByTagNameNS(RDF_NAMESPACE, "li"):
+                            value = self._get_text(item)
+                            retval[item.getAttribute("xml:lang")] = value
+                else:
+                    retval["x-default"] = self._get_text(element)
         ns_cache = self.cache.setdefault(namespace, {})
         ns_cache[name] = retval
         return retval
