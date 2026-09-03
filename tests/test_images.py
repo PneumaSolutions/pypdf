@@ -18,7 +18,15 @@ from pypdf import PageObject, PdfReader, PdfWriter
 from pypdf._page import ImageFile
 from pypdf.errors import LimitReachedError
 from pypdf.filters import JBIG2Decode
-from pypdf.generic import ContentStream, NameObject, NullObject
+from pypdf.generic import (
+    ContentStream,
+    DecodedStreamObject,
+    DictionaryObject,
+    NameObject,
+    NullObject,
+    NumberObject,
+)
+from pypdf.generic._image_xobject import _handle_flate
 
 from . import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url
 from .utils import get_image_data
@@ -341,6 +349,35 @@ def test_cmyk_no_filter():
 
 
 @pytest.mark.enable_socket
+def test_cmyk_dct_with_identity_decode_is_not_inverted():
+    """Cf #2931"""
+    url = "https://github.com/user-attachments/files/17602693/example.pdf"
+    name = "iss2931.pdf"
+    reader = PdfReader(BytesIO(get_data_from_url(url=url, name=name)))
+    image = reader.pages[0].images[0].image
+
+    # Adobe CMYK JPEGs store inverted values. This one also carries an explicit
+    # identity /Decode array, which must not cancel out that inversion.
+    #
+    # The exact samples come out of the JPEG decoder, so they are not asserted
+    # directly: they can shift by a step or two between libjpeg builds. What
+    # the fix changes is far larger than that - every channel comes back as its
+    # 255-complement when the inversion is dropped - so the assertions below
+    # pin the sample against that complement with a tolerance.
+    assert image.mode == "CMYK"
+    for xy, expected in (
+        ((0, 0), (121, 102, 114, 42)),        # light grey wall
+        ((449, 629), (153, 137, 74, 82)),     # dark suit
+    ):
+        actual = image.getpixel(xy)
+        assert all(abs(a - e) <= 8 for a, e in zip(actual, expected)), (
+            f"pixel {xy}: got {actual}, expected close to {expected}. "
+            f"Without the fix this decodes to roughly "
+            f"{tuple(255 - value for value in expected)}."
+        )
+
+
+@pytest.mark.enable_socket
 def test_separation_1byte_to_rgb_inverted():
     """Cf #2343"""
     url = "https://github.com/py-pdf/pypdf/files/13679585/test2_P038-038.pdf"
@@ -581,6 +618,54 @@ def test_4bits_images(caplog):
     assert image_similarity(reader.pages[0].images[1].image, img) == 1.0
 
 
+def test_low_bit_devicergb_image_mode():
+    """Low-bit (2/4) /DeviceRGB images decode to RGB, not palette (#3924)."""
+    # 2x2, 4-bit DeviceRGB: red, green / blue, white.
+    # Samples are 3 interleaved 4-bit components per pixel, high nibble first.
+    data = bytes([0xF0, 0x00, 0xF0, 0x00, 0xFF, 0xFF])
+    img = _handle_flate((2, 2), data, "4bits", "/DeviceRGB", 3, "")[0]
+    assert img.mode == "RGB"
+    assert img.size == (2, 2)
+    assert img.tobytes() == bytes(
+        [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]
+    )
+
+    # A single-component space must still map to a palette image ("P").
+    gray = _handle_flate((2, 2), bytes([0xF0, 0x0F]), "4bits", "/DeviceGray", 1, "")[0]
+    assert gray.mode == "P"
+
+
+def test_low_bit_devicergb_image_without_filter():
+    """Low-bit /DeviceRGB images decode even without a filter (#3367)."""
+    # Same 2x2 4-bit DeviceRGB samples as above, but stored uncompressed:
+    # images without a filter never reach the FlateDecode handler.
+    writer = PdfWriter()
+    image = DecodedStreamObject()
+    image.set_data(bytes([0xF0, 0x00, 0xF0, 0x00, 0xFF, 0xFF]))
+    image[NameObject("/Type")] = NameObject("/XObject")
+    image[NameObject("/Subtype")] = NameObject("/Image")
+    image[NameObject("/Width")] = NumberObject(2)
+    image[NameObject("/Height")] = NumberObject(2)
+    image[NameObject("/BitsPerComponent")] = NumberObject(4)
+    image[NameObject("/ColorSpace")] = NameObject("/DeviceRGB")
+    image[NameObject("/Colors")] = NumberObject(3)
+
+    page = writer.add_blank_page(20, 20)
+    page[NameObject("/Resources")] = DictionaryObject()
+    page["/Resources"][NameObject("/XObject")] = DictionaryObject()
+    page["/Resources"]["/XObject"][NameObject("/Im0")] = writer._add_object(image)
+
+    output = BytesIO()
+    writer.write(output)
+    output.seek(0)
+
+    img = PdfReader(output).pages[0].images[0].image
+    assert img.mode == "RGB"
+    assert img.tobytes() == bytes(
+        [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]
+    )
+
+
 @pytest.mark.enable_socket
 def test_no_filter_with_colorspace_as_list():
     """Tests for #2998"""
@@ -637,6 +722,10 @@ EI Q
         # `/Width` that is not a number.
         b"q BI /W (x) /H 2 /CS /RGB /BPC 8 ID " + b"\x00" * 12 + b" EI Q",
     ],
+    ids=[
+        "Empty filter array", "Non-name filter", "Empty color space", "Non-name color space",
+        "Non-number bits per component", "Missing height", "Missing width", "Non-number width"
+    ]
 )
 def test_contentstream__read_inline_image__malformed_settings(data):
     """A malformed inline image dictionary must not crash content stream parsing."""
@@ -828,7 +917,8 @@ def test_inline_images_setter_clears_cache():
     assert page._content_stream_images is not None
 
     # Clear cache via setter
-    page.inline_images = None
+    with pytest.warns(DeprecationWarning, match=r"PageObject\.inline_images is deprecated.*"):
+        page.inline_images = None
     assert page._content_stream_images is None
 
 
@@ -843,7 +933,8 @@ def test_inline_images_setter_merges():
     original_keys = set(page._content_stream_images.keys())
 
     # Merge new values
-    page.inline_images = {"new_key": page.images[0]}
+    with pytest.warns(DeprecationWarning, match=r"PageObject\.inline_images is deprecated.*"):
+        page.inline_images = {"new_key": page.images[0]}
     assert page._content_stream_images is not None
     merged_keys = set(page._content_stream_images.keys())
     assert original_keys.issubset(merged_keys), "Original keys should be preserved"

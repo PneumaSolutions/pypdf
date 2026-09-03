@@ -33,11 +33,13 @@ from pypdf.generic import (
     ArrayObject,
     BooleanObject,
     ContentStream,
+    DecodedStreamObject,
     DictionaryObject,
     IndirectObject,
     NameObject,
     NullObject,
     NumberObject,
+    PdfObject,
     StreamObject,
     TextStringObject,
 )
@@ -1067,6 +1069,18 @@ def test_deprecate_inline_image_filters():
     assert decode_stream_data(stream).startswith(b"II*")
 
 
+def test_decode_stream_data__default_parms_are_dictionary_objects():
+    """A stream without /DecodeParms hands the decoders a DictionaryObject."""
+    stream = DecodedStreamObject()
+    stream[NameObject("/Filter")] = NameObject("/FlateDecode")
+    stream._data = zlib.compress(b"hello")
+
+    with mock.patch.object(FlateDecode, "decode", return_value=b"hello") as decode:
+        assert decode_stream_data(stream) == b"hello"
+
+    assert isinstance(decode.call_args.args[1], DictionaryObject)
+
+
 def test_flatedecode__columns_is_zero():
     data = b"Hello World!"
     parameters = DictionaryObject({
@@ -1172,3 +1186,99 @@ def test_flatedecode__decode_png_prediction__speed():
     data = bytes(raw)
 
     FlateDecode._decode_png_prediction(data=data, columns=columns, row_length=row_length)
+
+
+_FLATE_IMAGE_DATA = (
+    b"\x00\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff"
+    b"\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff"
+    b"\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff"
+)
+
+
+def _generate_flate_pdf(decode_parms_type: type[PdfObject]) -> bytes:
+    compressed = zlib.compress(_FLATE_IMAGE_DATA)
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=10, height=10)
+
+    if decode_parms_type is DictionaryObject or decode_parms_type is IndirectObject:
+        decode_parms = DictionaryObject({
+            NameObject("/Predictor"): NumberObject(15),
+            NameObject("/Colors"): NumberObject(3),
+            NameObject("/BitsPerComponent"): NumberObject(8),
+            NameObject("/Columns"): NumberObject(10),
+        })
+        if decode_parms_type is IndirectObject:
+            decode_parms = writer._add_object(decode_parms)
+    else:
+        decode_parms = decode_parms_type()
+
+    image_stream = DecodedStreamObject()
+    image_stream.set_data(compressed)
+    image_stream.update({
+        NameObject("/Type"): NameObject("/XObject"),
+        NameObject("/Subtype"): NameObject("/Image"),
+        NameObject("/Width"): NumberObject(10),
+        NameObject("/Height"): NumberObject(10),
+        NameObject("/ColorSpace"): NameObject("/DeviceRGB"),
+        NameObject("/BitsPerComponent"): NumberObject(8),
+        NameObject("/Filter"): NameObject("/FlateDecode"),
+        NameObject("/DecodeParms"): decode_parms,
+    })
+
+    image_reference = writer._add_object(image_stream)
+    resources = DictionaryObject({
+        NameObject("/XObject"): DictionaryObject({
+            NameObject("/Im0"): image_reference
+        })
+    })
+    page[NameObject("/Resources")] = resources
+
+    contents = ContentStream(stream=None, pdf=writer)
+    contents.set_data(b"q\n10 0 0 10 0 0 cm\n/Im0 Do\nQ\n")
+    page.replace_contents(contents)
+
+    data = BytesIO()
+    writer.write(data)
+    return data.getvalue()
+
+
+@pytest.mark.parametrize(
+    "decode_params_type",
+    [
+        DictionaryObject,
+        IndirectObject,
+    ]
+)
+def test_flate_decode__decode__decode_parms_types__valid(decode_params_type: type[PdfObject]) -> None:
+    reader = PdfReader(BytesIO(_generate_flate_pdf(decode_params_type)))
+    page = reader.pages[0]
+    images = page.images
+    assert len(images) == 1
+    image = images[0]
+    for i in range(10):
+        for j in range(10):
+            pixel = (255, 255, 255) if i == j else (0, 0, 0)
+            assert image.image.getpixel((i, j)) == pixel
+
+
+def test_flate_decode__decode__decode_parms_types__array_object(caplog) -> None:
+    compressed = zlib.compress(_FLATE_IMAGE_DATA)
+    _ = FlateDecode.decode(decode_parms=ArrayObject([NumberObject(10)]), data=compressed)
+    assert caplog.messages == ["Detected invalid /DecodeParms, results might be incorrect: [10] (type ArrayObject)"]
+
+
+def test_flate_decode__decode__decode_parms_types__null_object(caplog) -> None:
+    compressed = zlib.compress(_FLATE_IMAGE_DATA)
+    _ = FlateDecode.decode(decode_parms=NullObject(), data=compressed)
+    assert caplog.messages == []

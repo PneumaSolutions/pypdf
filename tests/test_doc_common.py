@@ -21,6 +21,7 @@ from pypdf.generic import (
     NameObject,
     NullObject,
     NumberObject,
+    RectangleObject,
     TextStringObject,
     TreeObject,
     ViewerPreferences,
@@ -206,6 +207,55 @@ def test_build_destination__short_array():
         "title", ArrayObject([NumberObject(0), NameObject("/FitR"), NumberObject(1), NumberObject(2)])
     )
     assert dest["/Type"] == "/FitR"
+
+
+def _reader_with_button_field(field: DictionaryObject) -> PdfReader:
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    reference = writer._add_object(field)
+    acroform = DictionaryObject()
+    acroform[NameObject("/Fields")] = ArrayObject([reference])
+    writer.root_object[NameObject("/AcroForm")] = writer._add_object(acroform)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    return PdfReader(stream)
+
+
+def test_build_field__checkbox_missing_normal_appearance():
+    # A checkbox whose /AP is not a dictionary raises a clean PdfReadError
+    # instead of an uncaught KeyError.
+    field = DictionaryObject()
+    field[NameObject("/T")] = TextStringObject("CheckBox")
+    field[NameObject("/FT")] = NameObject("/Btn")
+    field[NameObject("/AP")] = ArrayObject()
+    with pytest.raises(PdfReadError, match="Expected appearance dictionary"):
+        _reader_with_button_field(field).get_fields()
+
+    # A checkbox whose /AP has no /N sub-dictionary raises likewise.
+    field[NameObject("/AP")] = DictionaryObject()
+    with pytest.raises(PdfReadError, match="Expected /N appearance dictionary"):
+        _reader_with_button_field(field).get_fields()
+
+    # A well-formed /AP /N still collects the appearance states.
+    normal = DictionaryObject()
+    normal[NameObject("/Yes")] = NumberObject(1)
+    appearance = DictionaryObject()
+    appearance[NameObject("/N")] = normal
+    field[NameObject("/AP")] = appearance
+    fields = _reader_with_button_field(field).get_fields()
+    assert list(fields["CheckBox"]["/_States_"]) == ["/Yes", "/Off"]
+
+
+def test_build_field__radio_kid_missing_appearance():
+    # A radio kid lacking /AP raises a clean PdfReadError instead of a KeyError.
+    field = DictionaryObject()
+    field[NameObject("/T")] = TextStringObject("Radio")
+    field[NameObject("/FT")] = NameObject("/Btn")
+    field[NameObject("/Ff")] = NumberObject(1 << 15)
+    field[NameObject("/Kids")] = ArrayObject([DictionaryObject()])
+    with pytest.raises(PdfReadError, match="missing /AP"):
+        _reader_with_button_field(field).get_fields()
 
 
 @pytest.mark.enable_socket
@@ -493,6 +543,130 @@ def test_flatten__cyclic_references():
         reader._flatten()
 
 
+def test_flatten__repeated_page_reference():
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    pages = writer.root_object["/Pages"].get_object()
+    pages[NameObject("/Rotate")] = NumberObject(180)
+    kids = pages["/Kids"]
+    kids[0].get_object()[NameObject("/Rotate")] = NumberObject(90)
+    kids.append(kids[0])
+    pages[NameObject("/Count")] = NumberObject(2)
+    pdf = BytesIO()
+    writer.write(pdf)
+    pdf.seek(0)
+
+    reader = PdfReader(pdf)
+
+    assert len(reader.pages) == 2
+    assert [page.rotation for page in reader.pages] == [90, 90]
+
+
+@pytest.mark.parametrize("list_only", [False, True])
+def test_flatten__repeated_page_reference_with_different_inheritance(list_only: bool):
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    pages = writer.root_object["/Pages"].get_object()
+    page = pages["/Kids"][0]
+    del page.get_object()[NameObject("/MediaBox")]
+
+    first_pages = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Pages"),
+                NameObject("/Kids"): ArrayObject([page]),
+                NameObject("/Count"): NumberObject(1),
+                NameObject("/MediaBox"): RectangleObject([0, 0, 100, 100]),
+            }
+        )
+    )
+    second_pages = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Pages"),
+                NameObject("/Kids"): ArrayObject([page]),
+                NameObject("/Count"): NumberObject(1),
+                NameObject("/MediaBox"): RectangleObject([0, 0, 200, 200]),
+            }
+        )
+    )
+    pages[NameObject("/Kids")] = ArrayObject([first_pages, second_pages])
+    pages[NameObject("/Count")] = NumberObject(2)
+    pdf = BytesIO()
+    writer.write(pdf)
+    pdf.seek(0)
+
+    reader = PdfReader(pdf)
+    reader._flatten(list_only=list_only)
+
+    assert len(reader.pages) == 2
+    assert reader.pages[0]["/MediaBox"] == RectangleObject([0, 0, 100, 100])
+    assert reader.pages[1]["/MediaBox"] == RectangleObject([0, 0, 200, 200])
+
+
+def test_flatten__depth_limit():
+    writer = PdfWriter()
+    page = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Page"),
+                NameObject("/MediaBox"): RectangleObject([0, 0, 100, 100]),
+            }
+        )
+    )
+    child = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Pages"),
+                NameObject("/Kids"): ArrayObject([page]),
+                NameObject("/Count"): NumberObject(1),
+            }
+        )
+    )
+    writer.root_object[NameObject("/Pages")] = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Pages"),
+                NameObject("/Kids"): ArrayObject([child]),
+                NameObject("/Count"): NumberObject(1),
+            }
+        )
+    )
+
+    with mock.patch("pypdf._doc_common.PAGE_TREE_MAX_DEPTH", 1), pytest.raises(
+        LimitReachedError, match=r"^Maximum page tree depth reached: 2 > 1\.$"
+    ):
+        writer._flatten()
+
+
+def test_flatten__entry_limit_for_reused_paths():
+    writer = PdfWriter()
+    child = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Page"),
+                NameObject("/MediaBox"): RectangleObject([0, 0, 100, 100]),
+            }
+        )
+    )
+    for _ in range(8):
+        child = writer._add_object(
+            DictionaryObject(
+                {
+                    NameObject("/Type"): NameObject("/Pages"),
+                    NameObject("/Kids"): ArrayObject([child, child]),
+                    NameObject("/Count"): NumberObject(2),
+                }
+            )
+        )
+    writer.root_object[NameObject("/Pages")] = child
+
+    with mock.patch("pypdf._doc_common.PAGE_TREE_MAX_ENTRIES", 100), pytest.raises(
+        LimitReachedError, match=r"^Maximum page tree entry limit reached: 101 > 100\.$"
+    ):
+        writer._flatten()
+
+
 def test_flatten__pages_without_kids():
     # A malformed /Pages node may advertise "/Count 0" without providing any
     # /Kids entry. Flattening such a page tree used to raise a bare
@@ -643,6 +817,30 @@ def test_xfa__decompression_limit():
         _ = reader.xfa
 
 
+def test_get_form_text_fields__mapping_name_without_partial_name():
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+
+    # A text field carrying only a mapping name (/TM) and no partial name (/T)
+    # is tolerated when building the field tree, so reading the text fields by
+    # short name should fall back to the qualified name instead of raising.
+    field = DictionaryObject()
+    field[NameObject("/FT")] = NameObject("/Tx")
+    field[NameObject("/TM")] = TextStringObject("mappingname")
+    field[NameObject("/V")] = TextStringObject("hello")
+
+    acro = DictionaryObject()
+    acro[NameObject("/Fields")] = ArrayObject([writer._add_object(field)])
+    writer.root_object[NameObject("/AcroForm")] = writer._add_object(acro)
+
+    data = BytesIO()
+    writer.write(data)
+    data.seek(0)
+
+    reader = PdfReader(data)
+    assert reader.get_form_text_fields() == {"mappingname": "hello"}
+
+
 @pytest.mark.timeout(5)
 def test_get_pages_showing_field__cyclic() -> None:
     writer = PdfWriter()
@@ -694,3 +892,113 @@ def test_get_qualified_field_name__cyclic() -> None:
             match=r"^Detected cycle in /Parent hierarchy when retrieving qualified field name\.$"
     ):
         _ = writer._get_qualified_field_name(parent=dictionary1)
+
+
+def test_build_outline_item__non_array_color(caplog):
+    """A malformed outline item whose /C is not an array must not crash."""
+    writer = PdfWriter()
+    writer.add_blank_page(72, 72)
+
+    item = DictionaryObject()
+    writer._add_object(item)
+    item.update({
+        NameObject("/Title"): TextStringObject("Bad color"),
+        NameObject("/Dest"): ArrayObject(
+            [writer.pages[0].indirect_reference, NameObject("/Fit")]
+        ),
+        NameObject("/C"): NumberObject(5),  # should be an [r, g, b] array
+    })
+    outlines = DictionaryObject()
+    writer._add_object(outlines)
+    outlines.update({
+        NameObject("/Type"): NameObject("/Outlines"),
+        NameObject("/First"): item.indirect_reference,
+        NameObject("/Last"): item.indirect_reference,
+    })
+    item[NameObject("/Parent")] = outlines.indirect_reference
+    writer._root_object[NameObject("/Outlines")] = outlines.indirect_reference
+
+    outline = writer.outline
+    assert outline[0]["/Title"] == "Bad color"
+    assert "/C" not in outline[0]
+    assert any("outline color" in message for message in caplog.messages)
+
+    # The same value is read again, unsanitised, while cloning the outline
+    # during append, so that path must tolerate it too.
+    target = PdfWriter()
+    target.append(writer)
+
+
+def test_get_page_in_node__cycle():
+    writer = PdfWriter()
+    page1 = DictionaryObject({
+        NameObject("/Count"): NumberObject(100)
+    })
+    page2 = DictionaryObject({
+        NameObject("/Count"): NumberObject(100)
+    })
+    page3 = DictionaryObject({
+        NameObject("/Count"): NumberObject(100),
+        NameObject("/Kids"): ArrayObject([writer._add_object(page1)])
+    })
+    page1[NameObject("/Kids")] = ArrayObject([writer._add_object(page2)])
+    page2[NameObject("/Kids")] = ArrayObject([writer._add_object(page3)])
+    writer.root_object[NameObject("/Pages")] = writer._add_object(page1)
+
+    with pytest.raises(LimitReachedError, match=r"^Detected cycle in /Pages hierarchy when retrieving page\.$"):
+        writer._get_page_in_node(42)
+
+
+def test_get_outline__depth():
+    writer = PdfWriter()
+    outlines = [
+        DictionaryObject({NameObject("/Title"): TextStringObject(f"Title{i}")})
+        for i in range(3)
+    ]
+    writer.root_object[NameObject("/Outlines")] = DictionaryObject({
+        NameObject("/First"): writer._add_object(outlines[0])
+    })
+    for index, outline in enumerate(outlines[:-1]):
+        outline[NameObject("/First")] = writer._add_object(outlines[index + 1])
+        outline[NameObject("/Next")] = writer._add_object(outlines[index + 1])
+        writer._add_object(outline)
+
+    assert writer._get_outline() == [
+        {"/%is_open%": True, "/Page": NullObject(), "/Title": "Title0", "/Type": "/Fit"},
+        [
+            {"/%is_open%": True, "/Page": NullObject(), "/Title": "Title1", "/Type": "/Fit"},
+            [
+                {"/%is_open%": True, "/Page": NullObject(), "/Title": "Title2", "/Type": "/Fit"}
+            ],
+            {"/%is_open%": True, "/Page": NullObject(), "/Title": "Title2", "/Type": "/Fit"}
+        ],
+        {"/%is_open%": True, "/Page": NullObject(), "/Title": "Title1", "/Type": "/Fit"},
+        [
+            {"/%is_open%": True, "/Page": NullObject(), "/Title": "Title2", "/Type": "/Fit"}
+        ],
+        {"/%is_open%": True, "/Page": NullObject(), "/Title": "Title2", "/Type": "/Fit"}
+    ]
+
+    with pytest.raises(expected_exception=LimitReachedError, match=r"^Maximum outline depth reached: 101 > 100\.$"):
+        writer._get_outline(depth=99)
+
+
+def test_get_outline__entry_count():
+    writer = PdfWriter()
+    outlines = [
+        DictionaryObject({NameObject("/Title"): TextStringObject(f"Title{i}")})
+        for i in range(10)
+    ]
+    writer.root_object[NameObject("/Outlines")] = DictionaryObject({
+        NameObject("/First"): writer._add_object(outlines[0])
+    })
+    for index, outline in enumerate(outlines[:-1]):
+        outline[NameObject("/First")] = writer._add_object(outlines[index + 1])
+        outline[NameObject("/Next")] = writer._add_object(outlines[index + 1])
+        writer._add_object(outline)
+
+    with mock.patch("pypdf._doc_common.OUTLINE_MAX_ENTRIES", 1000), \
+            pytest.raises(
+                expected_exception=LimitReachedError, match=r"^Maximum outline entry limit reached: 1001 > 1000\.$"
+            ):
+        writer._get_outline()

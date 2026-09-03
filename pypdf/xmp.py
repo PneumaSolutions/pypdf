@@ -26,7 +26,7 @@ from xml.parsers.expat import ExpatError, XMLParserType
 from ._protocols import XmpInformationProtocol
 from ._utils import StreamType, deprecate_with_replacement, deprecation_no_replacement
 from .errors import LimitReachedError, PdfReadError, XmpDocumentError
-from .generic import ContentStream, PdfObject
+from .generic import ContentStream, PdfObject, StreamObject
 
 XMP_MAX_INPUT_LENGTH = 5_000_000
 XMP_MAX_ELEMENT_COUNT = 100_000
@@ -217,7 +217,7 @@ class XmpInformation(XmpInformationProtocol, PdfObject):
 
     """
 
-    def __init__(self, stream: ContentStream) -> None:
+    def __init__(self, stream: StreamObject) -> None:
         self.stream = stream
         try:
             data = self.stream.get_data()
@@ -247,7 +247,7 @@ class XmpInformation(XmpInformationProtocol, PdfObject):
         return cls(stream)
 
     def write_to_stream(
-        self, stream: StreamType, encryption_key: Union[None, str, bytes] = None
+        self, stream: StreamType, encryption_key: Union[str, bytes, None] = None
     ) -> None:
         deprecate_with_replacement(
             "XmpInformation.write_to_stream",

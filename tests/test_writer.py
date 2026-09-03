@@ -19,6 +19,7 @@ from pypdf import (
     PdfWriter,
     Transformation,
 )
+from pypdf._font import Font
 from pypdf.annotations import Link
 from pypdf.errors import DeprecationError, LimitReachedError, PageSizeNotDefinedError, PdfReadError, PyPdfError
 from pypdf.generic import (
@@ -899,6 +900,120 @@ def test_link_annotation(pdf_file_path):
         writer.write(output_stream)
 
 
+def test_append_preserves_internal_link_annotation():
+    """
+    `append()`/`merge()` must keep internal `Link` annotations whose
+    destination references the target page by index (as produced by
+    `Link(target_page_index=...)`) and remap that index to the cloned page.
+
+    Tests #3953
+    """
+    source = PdfWriter()
+    for _ in range(3):
+        source.add_blank_page(width=595, height=842)
+    source.add_annotation(
+        page_number=1,
+        annotation=Link(
+            rect=(57, 700, 500, 720),
+            target_page_index=2,
+            fit=Fit(fit_type="/Fit"),
+        ),
+    )
+    source_buffer = BytesIO()
+    source.write(source_buffer)
+    source_buffer.seek(0)
+    reader = PdfReader(source_buffer)
+
+    # Two pre-existing pages so the appended pages (and the destination page
+    # index) are shifted, exercising the remapping.
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.add_blank_page(width=100, height=100)
+    writer.append(reader)
+
+    result_buffer = BytesIO()
+    writer.write(result_buffer)
+    result_buffer.seek(0)
+    result = PdfReader(result_buffer)
+
+    link_page = result.pages[3]
+    assert "/Annots" in link_page
+    annotation = link_page["/Annots"][0].get_object()
+    assert annotation["/Subtype"] == "/Link"
+    destination = annotation["/Dest"]
+    # The bare page index must have been resolved to an indirect page reference
+    # pointing at the correctly offset cloned page (index 4).
+    target = destination[0].get_object()
+    assert result.pages[4].indirect_reference.idnum == destination[0].idnum
+    assert target["/Type"] == "/Page"
+
+
+def test_get_cloned_page_out_of_range_index_is_dropped():
+    """
+    A destination index that points past the end of the source document
+    resolves to `None` instead of raising `IndexError`.
+
+    Tests #3953
+    """
+    source = PdfWriter()
+    source.add_blank_page(width=100, height=100)
+    source_buffer = BytesIO()
+    source.write(source_buffer)
+    source_buffer.seek(0)
+    reader = PdfReader(source_buffer)
+
+    writer = PdfWriter()
+    writer.append(reader)
+    # The source document has a single page, so index 5 is out of range.
+    assert writer._get_cloned_page(5, {}, reader) is None
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        # Empty /Dest array.
+        DictionaryObject({
+            NameObject("/Subtype"): NameObject("/Link"),
+            NameObject("/Dest"): ArrayObject([]),
+        }),
+        # Empty /GoTo action destination.
+        DictionaryObject({
+            NameObject("/Subtype"): NameObject("/Link"),
+            NameObject("/A"): DictionaryObject({
+                NameObject("/S"): NameObject("/GoTo"),
+                NameObject("/D"): ArrayObject([]),
+            }),
+        }),
+        # /Dest that is not an array at all.
+        DictionaryObject({
+            NameObject("/Subtype"): NameObject("/Link"),
+            NameObject("/Dest"): NumberObject(5),
+        }),
+    ],
+    ids=["empty-dest-array", "empty-goto-action-dest", "non-array-dest"],
+)
+def test_malformed_link_destination_does_not_crash_transfer(annotation):
+    """A link with an empty or non-array destination must not abort page transfer."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.pages[0][NameObject("/Annots")] = ArrayObject([writer._add_object(annotation)])
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    # append() routes the annotation through _insert_filtered_annotations.
+    appended = PdfWriter()
+    appended.append(reader)
+    appended.write(BytesIO())
+
+    # add_page() + write() routes it through extract_links()/_resolve_links().
+    added = PdfWriter()
+    for page in reader.pages:
+        added.add_page(page)
+    added.write(BytesIO())
+
+
 def test_io_streams():
     """This is the example from the docs ("Streaming data")."""
     filepath = RESOURCE_ROOT / "pdflatex-outline.pdf"
@@ -992,6 +1107,15 @@ def test_pdf_header():
 
     writer.pdf_header = b"%PDF-1.6"
     assert writer.pdf_header == "%PDF-1.6"
+
+
+def test_pdf_header__keep_initial_header():
+    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
+    writer = PdfWriter(clone_from=reader)
+    assert writer.pdf_header == "%PDF-1.3"
+
+    writer = PdfWriter(clone_from=reader, keep_initial_header=True)
+    assert writer.pdf_header == "%PDF-1.5"
 
 
 def test_write_dict_stream_object(pdf_file_path):
@@ -1180,6 +1304,12 @@ def test_reset_translation():
     nb = len(writer.pages)
     writer.append(reader, [reader.pages[0], reader.pages[0]])
     assert len(writer.pages) == nb + 2
+
+
+def test_reset_translation_invalid_parameter():
+    writer = PdfWriter()
+    with pytest.raises(TypeError, match=r"^Invalid parameter not-a-reader$"):
+        writer.reset_translation("not-a-reader")
 
 
 def test_threads_empty():
@@ -1615,7 +1745,7 @@ def test_update_form_fields(caplog, tmp_path):
     del writer.pages[0]["/Resources"]["/Font"]
     writer.update_page_form_field_values(
         writer.pages[0],
-        {"Text1": "my Text1", "Text2": "ligne1\nligne2\nligne3"},
+        {"Text1": "my \\ your (Text1)", "Text2": "ligne1\nligne2\nligne3"},
         auto_regenerate=False,
     )
     writer.update_page_form_field_values(
@@ -1631,7 +1761,7 @@ def test_update_form_fields(caplog, tmp_path):
     assert flds["CheckBox1"]["/V"] == "/Yes"
     assert flds["CheckBox1"].indirect_reference.get_object()["/AS"] == "/Yes"
     assert (
-        b"(my Text1)"
+        rb"(my \\ your \(Text1\))"
         in flds["Text1"].indirect_reference.get_object()["/AP"]["/N"].get_data()
     )
     assert flds["Text2"]["/V"] == "ligne1\nligne2\nligne3"
@@ -1705,7 +1835,7 @@ def test_merge_content_stream_to_page():
     """Test that new content data is correctly added to page contents
     in the form of an ArrayObject or StreamObject. The
     test_add_apstream_object code already correctly checks that
-    _merge_content_stream_to_page works for an emtpy page.
+    _merge_content_stream_to_page works for an empty page.
     """
     writer = PdfWriter()
     page = writer.add_blank_page(100, 100)
@@ -1746,7 +1876,7 @@ def test_update_form_fields2(caplog):
                     "MM": "04",
                     "DD": "21",
                     "YY": "24",
-                    "Initial": "RRG",
+                    "Initial": "ąčęėįšųūž. ĄČĘĖĮŠŲŪŽ.",
                     # "I DO NOT Agree": null,
                     # "Last Name": null
                 },
@@ -1785,7 +1915,7 @@ def test_update_form_fields2(caplog):
         writer = PdfWriter(clone_from=reader)
 
         writer.update_page_form_field_values(
-            None, my_files[file]["usage"]["fields"], auto_regenerate=True
+            None, my_files[file]["usage"]["fields"], auto_regenerate=True, flatten=True
         )
         merger.append(writer)
     assert merger.get_form_text_fields(True) == {
@@ -1794,7 +1924,7 @@ def test_update_form_fields2(caplog):
         "test1.MM": "04",
         "test1.DD": "21",
         "test1.YY": "24",
-        "test1.Initial": "RRG",
+        "test1.Initial": "ąčęėįšųūž. ĄČĘĖĮŠŲŪŽ.",
         "test1.I DO NOT Agree": None,
         "test1.Last Name": None,
         "test2.p2 First Name": "Joe",
@@ -1811,6 +1941,7 @@ def test_update_form_fields2(caplog):
         "test2.p3 DD": "25",
         "test2.p3 YY": "21",
     }
+    assert "/PYPDF1cp1257" in merger.pages[0]["/Resources"]["/Font"]
     assert "Text string 'شهرزاد' contains characters not supported by font encoding." in caplog.text
 
 
@@ -1830,7 +1961,7 @@ def test_update_form_fields3(caplog, tmp_path):
 
     # Test with fonttools
     data = {
-        "subsemnatul": "Σὲ γνωρίζω ἀπὸ τὴν κόψη",
+        "subsemnatul": "Σὲ γνωρίζω ἀπὸ τὴν κόψη",
         "localitatea": "شهرزاد",
         "strada": "Căpitan Nicolae Licăreț",
         "adresa_judet": "Конференция",
@@ -1841,6 +1972,7 @@ def test_update_form_fields3(caplog, tmp_path):
     assert new_font_resource in writer.pages[0]["/Annots"][0]["/DA"]
     assert new_font_resource in writer.pages[0]["/Resources"]["/Font"]
     assert new_font_resource in writer._root_object["/AcroForm"]["/DR"]["/Font"]
+    # Assert that we couldn't encode the data with this font
     writer.write(output)
     output.seek(0)
     reader = PdfReader(output)
@@ -1849,6 +1981,12 @@ def test_update_form_fields3(caplog, tmp_path):
         if expected_value != "شهرزاد":
             assert expected_value in extracted_text
     assert "Text string 'شهرزاد' contains characters not supported by font encoding." in caplog.text
+    # Retry with the new font right away, to increase coverage in _appearance_stream.py
+    writer.update_page_form_field_values(writer.pages[0], {"localitatea": ("شهرزاد", "/PYPDF1", 0)}, flatten=True)
+    # Cripple the font's ToUnicode cmap, to increase can_encode coverage in _font.py
+    del (writer.pages[0]["/Resources"]["/Font"]["/PYPDF1"]["/ToUnicode"])
+    font = Font.from_font_resource(writer.pages[0]["/Resources"]["/Font"]["/PYPDF1"])
+    assert not font.can_encode("Whatever text")
 
 
 @pytest.mark.enable_socket
@@ -2901,6 +3039,50 @@ def test_insert_filtered_annotations__annotations_are_none():
     assert writer._insert_filtered_annotations(
         annots=None, page=PageObject(), pages={}, reader=reader
     ) == []
+
+
+def test_writer_reader_attribute_always_present():
+    """
+    `PdfWriterProtocol` declares `_reader`, but it used to be assigned only in
+    the incremental branch, so a plain `PdfWriter()` did not satisfy the
+    protocol it is passed as. It is `None` outside incremental mode.
+    """
+    writer = PdfWriter()
+    assert writer._reader is None
+
+    writer.add_blank_page(72, 72)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    incremental = PdfWriter(stream, incremental=True)
+    assert incremental._reader is not None
+
+
+def test_id_translated_holds_the_source_document():
+    """
+    Each `_id_translated` entry keeps the source document alive under a
+    "PreventGC" key alongside the integer idnum mappings, so the mapping is
+    keyed by `int | str` rather than by `int` alone.
+    """
+    source = PdfWriter()
+    source.add_blank_page(72, 72)
+    stream = BytesIO()
+    source.write(stream)
+    stream.seek(0)
+
+    writer = PdfWriter()
+    writer.append(PdfReader(stream))
+
+    assert writer._id_translated
+    for translated in writer._id_translated.values():
+        assert translated["PreventGC"] is not None
+        # The remaining entries are the idnum -> idnum mappings.
+        assert all(
+            isinstance(value, int)
+            for key, value in translated.items()
+            if key != "PreventGC"
+        )
 
 
 def test_incremental_read():

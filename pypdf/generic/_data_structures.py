@@ -228,7 +228,7 @@ class ArrayObject(list[Any], PdfObject):
         return self
 
     def write_to_stream(
-        self, stream: StreamType, encryption_key: Union[None, str, bytes] = None
+        self, stream: StreamType, encryption_key: Union[str, bytes, None] = None
     ) -> None:
         if encryption_key is not None:  # deprecated
             deprecation_no_replacement(
@@ -244,7 +244,7 @@ class ArrayObject(list[Any], PdfObject):
     def read_from_stream(
         stream: StreamType,
         pdf: Optional[PdfReaderProtocol],
-        forced_encoding: Union[None, str, list[str], dict[int, str]] = None,
+        forced_encoding: Union[str, list[str], dict[int, str], None] = None,
     ) -> "ArrayObject":
         arr = ArrayObject()
         tmp = stream.read(1)
@@ -516,7 +516,7 @@ class DictionaryObject(dict[Any, Any], PdfObject):
         return XmpInformation(metadata)
 
     def write_to_stream(
-        self, stream: StreamType, encryption_key: Union[None, str, bytes] = None
+        self, stream: StreamType, encryption_key: Union[str, bytes, None] = None
     ) -> None:
         if encryption_key is not None:  # deprecated
             deprecation_no_replacement(
@@ -579,7 +579,7 @@ class DictionaryObject(dict[Any, Any], PdfObject):
     def read_from_stream(
         stream: StreamType,
         pdf: Optional[PdfReaderProtocol],
-        forced_encoding: Union[None, str, list[str], dict[int, str]] = None,
+        forced_encoding: Union[str, list[str], dict[int, str], None] = None,
     ) -> "DictionaryObject":
         tmp = stream.read(2)
         if tmp != b"<<":
@@ -761,7 +761,7 @@ class TreeObject(DictionaryObject):
         self.insert_child(child, None, pdf)
 
     def inc_parent_counter_default(
-        self, parent: Union[None, IndirectObject, "TreeObject"], n: int
+        self, parent: Union[IndirectObject, "TreeObject", None], n: int
     ) -> None:
         if is_null_or_none(parent):
             return
@@ -774,7 +774,7 @@ class TreeObject(DictionaryObject):
             self.inc_parent_counter_default(parent.get("/Parent", None), n)
 
     def inc_parent_counter_outline(
-        self, parent: Union[None, IndirectObject, "TreeObject"], n: int
+        self, parent: Union[IndirectObject, "TreeObject", None], n: int
     ) -> None:
         if is_null_or_none(parent):
             return
@@ -817,18 +817,25 @@ class TreeObject(DictionaryObject):
             return child_reference
         prev = cast("DictionaryObject", self["/Last"])
 
+        visited: set[int] = set()
         while prev.indirect_reference != before:
+            prev_id = id(prev)
+            if prev_id in visited:
+                raise LimitReachedError("Detected cycle in tree structure.")
+            visited.add(prev_id)
             if "/Next" in prev:
                 prev = cast("TreeObject", prev["/Next"])
-            else:  # append at the end
-                prev[NameObject("/Next")] = cast("TreeObject", child_reference)
-                child_obj[NameObject("/Prev")] = prev.indirect_reference
-                child_obj[NameObject("/Parent")] = self.indirect_reference
-                if "/Next" in child_obj:
-                    del child_obj["/Next"]
-                self[NameObject("/Last")] = child_reference
-                inc_parent_counter(self, child_obj.get("/Count", 1))
-                return child_reference
+                continue
+
+            # append at the end
+            prev[NameObject("/Next")] = cast("TreeObject", child_reference)
+            child_obj[NameObject("/Prev")] = prev.indirect_reference
+            child_obj[NameObject("/Parent")] = self.indirect_reference
+            if "/Next" in child_obj:
+                del child_obj["/Next"]
+            self[NameObject("/Last")] = child_reference
+            inc_parent_counter(self, child_obj.get("/Count", 1))
+            return child_reference
         try:  # insert as first or in the middle
             assert isinstance(prev["/Prev"], DictionaryObject)
             prev["/Prev"][NameObject("/Next")] = child_reference
@@ -902,7 +909,7 @@ class TreeObject(DictionaryObject):
         last = last_ref.get_object()
         while cur is not None:
             if cur == child_obj:
-                self._remove_node_from_tree(prev, prev_ref, cur, last)
+                TreeObject._remove_node_from_tree(self, prev, prev_ref, cur, last)
                 found = True
                 break
 
@@ -923,7 +930,7 @@ class TreeObject(DictionaryObject):
 
     def remove_from_tree(self) -> None:
         """Remove the object from the tree it is in."""
-        if NameObject("/Parent") not in self:
+        if "/Parent" not in self:
             raise ValueError("Removed child does not appear to be a tree item")
         cast("TreeObject", self["/Parent"]).remove_child(self)
 
@@ -1042,7 +1049,7 @@ class StreamObject(DictionaryObject):
         return data
 
     def write_to_stream(
-        self, stream: StreamType, encryption_key: Union[None, str, bytes] = None
+        self, stream: StreamType, encryption_key: Union[str, bytes, None] = None
     ) -> None:
         if encryption_key is not None:  # deprecated
             deprecation_no_replacement(
@@ -1212,7 +1219,7 @@ class ContentStream(DecodedStreamObject):
         self,
         stream: Any,
         pdf: Any,
-        forced_encoding: Union[None, str, list[str], dict[int, str]] = None,
+        forced_encoding: Union[str, list[str], dict[int, str], None] = None,
     ) -> None:
         self.pdf = pdf
         self._operations: list[tuple[Any, bytes]] = []
@@ -1532,7 +1539,7 @@ class ContentStream(DecodedStreamObject):
 
     # This overrides the parent method
     def write_to_stream(
-        self, stream: StreamType, encryption_key: Union[None, str, bytes] = None
+        self, stream: StreamType, encryption_key: Union[str, bytes, None] = None
     ) -> None:
         if not self._data and self._operations:
             self.get_data()  # this ensures ._data is rebuilt
@@ -1542,7 +1549,7 @@ class ContentStream(DecodedStreamObject):
 def read_object(
     stream: StreamType,
     pdf: Optional[PdfReaderProtocol],
-    forced_encoding: Union[None, str, list[str], dict[int, str]] = None,
+    forced_encoding: Union[str, list[str], dict[int, str], None] = None,
 ) -> Union[PdfObject, int, str, ContentStream]:
     tok = stream.read(1)
     stream.seek(-1, 1)  # reset to start
@@ -1709,6 +1716,23 @@ class Destination(TreeObject):
         DictionaryObject
     ] = None  # node provide access to the original Object
 
+    def remove_from_tree(self) -> None:
+        """
+        Remove the outline item this destination was built from.
+
+        `reader.outline` and `writer.outline` yield detached copies rather than
+        the nodes themselves, so the copy never has a `/Parent` and removing it
+        would be a no-op. `node` is the dictionary in the document.
+        """
+        if self.node is None:
+            super().remove_from_tree()
+        elif "/Parent" not in self.node:
+            raise ValueError("Removed child does not appear to be a tree item")
+        else:
+            TreeObject.remove_child(
+                cast("TreeObject", self.node["/Parent"]), self.node
+            )
+
     def __init__(
         self,
         title: Union[str, bytes],
@@ -1783,7 +1807,7 @@ class Destination(TreeObject):
         )
 
     def write_to_stream(
-        self, stream: StreamType, encryption_key: Union[None, str, bytes] = None
+        self, stream: StreamType, encryption_key: Union[str, bytes, None] = None
     ) -> None:
         if encryption_key is not None:  # deprecated
             deprecation_no_replacement(
