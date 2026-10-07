@@ -14,7 +14,7 @@ from unittest import mock
 import pytest
 from PIL import Image, ImageOps
 
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, apply_configuration
 from pypdf.errors import DependencyError, DeprecationError, LimitReachedError, PdfReadError, PdfStreamError
 from pypdf.filters import (
     ASCII85Decode,
@@ -275,7 +275,7 @@ def test_ccitt_fax_decode__unsigned_columns():
 def test_decompress_zlib_error(caplog):
     reader = PdfReader(BytesIO(get_data_from_url(name="tika-952445.pdf")))
     for page in reader.pages:
-        page.extract_text()
+        assert page.extract_text() == ""
     assert "incorrect startxref pointer(3)" in caplog.text
 
 
@@ -723,8 +723,7 @@ def test_flate_decode__image_is_none_due_to_size_limit(caplog):
     url = "https://github.com/user-attachments/files/19464256/file.pdf"
     name = "issue3220.pdf"
 
-    with mock.patch("pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH", 0), \
-            mock.patch("pypdf.filters.FLATE_MAX_BUFFER_SIZE", sys.maxsize):
+    with apply_configuration(zlib_maximum_output_length=0, image_maximum_buffer_size=sys.maxsize):
         reader = PdfReader(BytesIO(get_data_from_url(url=url, name=name)))
         images = reader.pages[0].images
         assert len(images) == 1
@@ -757,7 +756,7 @@ def test_flate_decode__not_rectangular(caplog):
 
 
 def test_jbig2decode__binary_errors():
-    with mock.patch("pypdf.filters.JBIG2DEC_BINARY", None), \
+    with apply_configuration(jbig2dec_binary=None), \
             pytest.raises(DependencyError, match=r"jbig2dec binary is not available\."):
         JBIG2Decode.decode(b"dummy")
 
@@ -770,7 +769,7 @@ def test_jbig2decode__binary_errors():
         )
     )
     with mock.patch("pypdf.filters.subprocess.run", return_value=result), \
-            mock.patch("pypdf.filters.JBIG2DEC_BINARY", "/usr/bin/jbig2dec"), \
+            apply_configuration(jbig2dec_binary="/usr/bin/jbig2dec"), \
             pytest.raises(DependencyError, match=r"jbig2dec>=0.19 is required\."):
         JBIG2Decode.decode(b"dummy")
 
@@ -783,7 +782,7 @@ def test_jbig2decode__binary_errors():
         )
     )
     with mock.patch("pypdf.filters.subprocess.run", return_value=result), \
-            mock.patch("pypdf.filters.JBIG2DEC_BINARY", "/usr/bin/jbig2dec"), \
+            apply_configuration(jbig2dec_binary="/usr/bin/jbig2dec"), \
             pytest.raises(DependencyError, match=r"jbig2dec>=0.19 is required\."):
         JBIG2Decode.decode(b"dummy")
 
@@ -937,16 +936,16 @@ def test_decompress():
 
     # Decompress byte-wise with very low output limit.
     with mock.patch("pypdf.filters._decompress_with_limit", side_effect=zlib.error), \
-            mock.patch("pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH", len(compressed) - 13), \
+            apply_configuration(zlib_maximum_output_length=len(compressed) - 13), \
             pytest.raises(
                 LimitReachedError, match=r"^Limit reached while decompressing\. 12 bytes remaining\.$"
             ):
         decompress(compressed)
 
     # Decompress byte-wise with input limit.
-    with mock.patch("pypdf.filters.ZLIB_MAX_RECOVERY_INPUT_LENGTH", 1000), \
+    with apply_configuration(zlib_maximum_recovery_input_length=1000), \
             pytest.raises(
-                LimitReachedError, match=r"^Recovery limit reached while decompressing\. 336 bytes remaining\.$"
+                LimitReachedError, match=r"^Recovery limit reached while decompressing\. 337 bytes remaining\.$"
             ):
         decompress(b"A" * 1337)
 
@@ -1105,7 +1104,7 @@ def test_runlengthdecode__decode_limit():
     encoded = (b"\x81A" * runs) + b"\x80"
 
     # Use a very low limit for this exact comparison, otherwise *pytest* takes ages to render a failure diff.
-    with mock.patch("pypdf.filters.RUN_LENGTH_MAX_OUTPUT_LENGTH", uncompressed_size):
+    with apply_configuration(run_length_maximum_output_length=uncompressed_size):
         assert RunLengthDecode.decode(encoded) == b"A" * uncompressed_size
 
 
@@ -1282,3 +1281,18 @@ def test_flate_decode__decode__decode_parms_types__null_object(caplog) -> None:
     compressed = zlib.compress(_FLATE_IMAGE_DATA)
     _ = FlateDecode.decode(decode_parms=NullObject(), data=compressed)
     assert caplog.messages == []
+
+
+@pytest.mark.timeout(10)  # Previously took about 28-33 seconds.
+def test_decompress__fallback__speed() -> None:
+    # `gzip` is an optional module: https://docs.python.org/3/library/gzip.html
+    gzip = pytest.importorskip("gzip")
+
+    buf = BytesIO()
+    size = 1_000_000
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=1, mtime=0) as f:
+        f.write(os.urandom(size))  # incompressible: stream size ~= input size
+    compressed = buf.getvalue()
+
+    result = decompress(compressed)
+    assert len(result) == size

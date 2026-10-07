@@ -3,6 +3,7 @@ import itertools
 import re
 import shutil
 import subprocess
+import sys
 from io import BytesIO
 from operator import itemgetter
 from pathlib import Path
@@ -10,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, apply_configuration
 from pypdf.errors import LimitReachedError, PdfReadError
 from pypdf.filters import FlateDecode
 from pypdf.generic import (
@@ -21,6 +22,7 @@ from pypdf.generic import (
     NameObject,
     NullObject,
     NumberObject,
+    PdfObject,
     RectangleObject,
     TextStringObject,
     TreeObject,
@@ -38,7 +40,7 @@ def test_attachments(tmpdir):
     # No attachments.
     clean_path = SAMPLE_ROOT / "002-trivial-libre-office-writer" / "002-trivial-libre-office-writer.pdf"
     with PdfReader(clean_path) as pdf:
-        assert pdf._list_attachments() == []
+        assert pdf.attachments == {}
         assert list(pdf.attachment_list) == []
 
     # UF = name.
@@ -47,8 +49,8 @@ def test_attachments(tmpdir):
     file_path.write_bytes(b"Hello World\n")
     subprocess.run([PDFATTACH_BINARY, clean_path, file_path, attached_path])  # noqa: S603
     with PdfReader(attached_path) as pdf:
-        assert pdf._list_attachments() == ["test.txt"]
-        assert pdf._get_attachments("test.txt") == {"test.txt": b"Hello World\n"}
+        assert list(pdf.attachments.keys()) == ["test.txt"]
+        assert pdf.attachments["test.txt"] == [b"Hello World\n"]
         assert [(x.name, x.content) for x in pdf.attachment_list] == [("test.txt", b"Hello World\n")]
         assert next(pdf.attachment_list).alternative_name == "test.txt"
 
@@ -56,9 +58,9 @@ def test_attachments(tmpdir):
     different_path = tmpdir / "different.pdf"
     different_path.write_bytes(re.sub(rb" /UF [^/]+ /", b" /UF(my-file.txt) /", attached_path.read_bytes()))
     with PdfReader(different_path) as pdf:
-        assert pdf._list_attachments() == ["test.txt", "my-file.txt"]
-        assert pdf._get_attachments("test.txt") == {"test.txt": b"Hello World\n"}
-        assert pdf._get_attachments("my-file.txt") == {"my-file.txt": b"Hello World\n"}
+        assert list(pdf.attachments.keys()) == ["test.txt", "my-file.txt"]
+        assert pdf.attachments["test.txt"] == [b"Hello World\n"]
+        assert pdf.attachments["my-file.txt"] == [b"Hello World\n"]
         assert [(x.name, x.content) for x in pdf.attachment_list] == [("test.txt", b"Hello World\n")]
         assert next(pdf.attachment_list).alternative_name == "my-file.txt"
 
@@ -66,8 +68,8 @@ def test_attachments(tmpdir):
     no_f_path = tmpdir / "no-f.pdf"
     no_f_path.write_bytes(re.sub(rb" /UF [^/]+ /", b" /", attached_path.read_bytes()))
     with PdfReader(no_f_path) as pdf:
-        assert pdf._list_attachments() == ["test.txt"]
-        assert pdf._get_attachments("test.txt") == {"test.txt": b"Hello World\n"}
+        assert list(pdf.attachments.keys()) == ["test.txt"]
+        assert pdf.attachments["test.txt"] == [b"Hello World\n"]
         assert [(x.name, x.content) for x in pdf.attachment_list] == [("test.txt", b"Hello World\n")]
         assert next(pdf.attachment_list).alternative_name is None
 
@@ -75,8 +77,8 @@ def test_attachments(tmpdir):
     uf_f_path = tmpdir / "uf-f.pdf"
     uf_f_path.write_bytes(attached_path.read_bytes().replace(b" /UF ", b"/F(file.txt) /UF "))
     with PdfReader(uf_f_path) as pdf:
-        assert pdf._list_attachments() == ["test.txt"]
-        assert pdf._get_attachments("test.txt") == {"test.txt": b"Hello World\n"}
+        assert list(pdf.attachments.keys()) == ["test.txt"]
+        assert pdf.attachments["test.txt"] == [b"Hello World\n"]
         assert [(x.name, x.content) for x in pdf.attachment_list] == [("test.txt", b"Hello World\n")]
         assert next(pdf.attachment_list).alternative_name == "test.txt"
 
@@ -84,8 +86,8 @@ def test_attachments(tmpdir):
     only_f_path = tmpdir / "f.pdf"
     only_f_path.write_bytes(attached_path.read_bytes().replace(b" /UF ", b" /F "))
     with PdfReader(only_f_path) as pdf:
-        assert pdf._list_attachments() == ["test.txt"]
-        assert pdf._get_attachments("test.txt") == {"test.txt": b"Hello World\n"}
+        assert list(pdf.attachments.keys()) == ["test.txt"]
+        assert pdf.attachments["test.txt"] == [b"Hello World\n"]
         assert [(x.name, x.content) for x in pdf.attachment_list] == [("test.txt", b"Hello World\n")]
         assert next(pdf.attachment_list).alternative_name == "test.txt"
 
@@ -95,9 +97,7 @@ def test_get_attachments__same_attachment_more_than_twice():
     writer.add_blank_page(100, 100)
     for i in range(5):
         writer.add_attachment("test.txt", f"content{i}")
-    assert writer._get_attachments("test.txt") == {
-        "test.txt": [b"content0", b"content1", b"content2", b"content3", b"content4"]
-    }
+    assert writer.attachments["test.txt"] == [b"content0", b"content1", b"content2", b"content3", b"content4"]
     assert [(x.name, x.content) for x in writer.attachment_list] == [
         ("test.txt", b"content0"),
         ("test.txt", b"content1"),
@@ -118,7 +118,21 @@ def test_get_attachments__alternative_name_is_none():
             "pypdf.generic._files.EmbeddedFile.content",
             new_callable=mock.PropertyMock(return_value=b"content")
     ):
-        assert writer._get_attachments() == {"test.txt": b"content"}
+        assert dict(writer.attachments) == {"test.txt": [b"content"]}
+
+
+def test_get_attachments__list_queried_only_once_per_result():
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    for index in range(5):
+        writer.add_attachment(f"test{index}.txt", f"content{index}")
+
+    original_load = EmbeddedFile._load
+    with mock.patch("pypdf.generic._files.EmbeddedFile._load", side_effect=original_load) as load_mock:
+        for index, (name, content) in enumerate(writer.attachments.items()):
+            assert name == f"test{index}.txt"
+            assert content == [f"content{index}".encode()]
+    load_mock.assert_called_once_with(writer.root_object, strict=False)
 
 
 @pytest.mark.enable_socket
@@ -194,19 +208,52 @@ def test_viewer_preferences__indirect_reference():
 
 
 def test_build_destination__short_array():
+    """A one-element array degrades to a null destination instead of raising on
+    the unpacking; a valid array with extra fit args still builds.
+    """
     writer = PdfWriter()
     writer.add_blank_page(width=72, height=72)
 
-    # An array too short to hold a page reference and a fit type degrades to a
-    # null destination instead of raising on the unpacking.
     dest = writer._build_destination("title", ArrayObject([NumberObject(0)]))
     assert isinstance(dest["/Page"], NullObject)
 
-    # A trailing fit type with the wrong number of arguments still builds.
     dest = writer._build_destination(
         "title", ArrayObject([NumberObject(0), NameObject("/FitR"), NumberObject(1), NumberObject(2)])
     )
     assert dest["/Type"] == "/FitR"
+
+
+def test_build_destination__non_array():
+    """A non-array destination degrades to a null destination rather than
+    raising TypeError while unpacking.
+    """
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+
+    dest = writer._build_destination("title", NumberObject(5))
+    assert isinstance(dest["/Page"], NullObject)
+
+
+def test_named_destinations__non_array_value():
+    """A bare number where a destination array is expected is skipped instead
+    of crashing named_destinations with a TypeError.
+    """
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    names = DictionaryObject()
+    names[NameObject("/Names")] = ArrayObject(
+        [TextStringObject("foo"), NumberObject(5)]
+    )
+    dests = DictionaryObject()
+    dests[NameObject("/Dests")] = names
+    writer.root_object[NameObject("/Names")] = dests
+
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+    reader = PdfReader(stream)
+
+    assert "foo" in reader.named_destinations
 
 
 def _reader_with_button_field(field: DictionaryObject) -> PdfReader:
@@ -633,7 +680,7 @@ def test_flatten__depth_limit():
         )
     )
 
-    with mock.patch("pypdf._doc_common.PAGE_TREE_MAX_DEPTH", 1), pytest.raises(
+    with apply_configuration(page_tree_maximum_depth=1), pytest.raises(
         LimitReachedError, match=r"^Maximum page tree depth reached: 2 > 1\.$"
     ):
         writer._flatten()
@@ -661,7 +708,7 @@ def test_flatten__entry_limit_for_reused_paths():
         )
     writer.root_object[NameObject("/Pages")] = child
 
-    with mock.patch("pypdf._doc_common.PAGE_TREE_MAX_ENTRIES", 100), pytest.raises(
+    with apply_configuration(page_tree_maximum_entries=100), pytest.raises(
         LimitReachedError, match=r"^Maximum page tree entry limit reached: 101 > 100\.$"
     ):
         writer._flatten()
@@ -707,6 +754,123 @@ def test_flatten__pages_with_non_array_kids():
 
     with pytest.raises(PdfReadError, match=r"^Expected /Kids to be an array, got NumberObject\.$"):
         list(reader.pages)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "_flatten recurses once per page-tree level, so a tree deeper than the "
+        "interpreter recursion limit raises RecursionError before "
+        "Configuration.page_tree_maximum_depth can apply. Passes once _flatten iterates."
+    ),
+)
+def test_flatten__deep_page_tree_does_not_exhaust_the_stack():
+    """A deeply nested /Pages tree is flattened without a RecursionError."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    node = writer.root_object["/Pages"]["/Kids"][0]
+
+    # Far deeper than the interpreter's recursion limit would allow a recursive
+    # traversal to go, but still one real page at the bottom.
+    depth = sys.getrecursionlimit() + 1
+    for _ in range(depth):
+        node = writer._add_object(
+            DictionaryObject(
+                {
+                    NameObject("/Type"): NameObject("/Pages"),
+                    NameObject("/Kids"): ArrayObject([node]),
+                    NameObject("/Count"): NumberObject(1),
+                }
+            )
+        )
+    writer.root_object[NameObject("/Pages")] = node
+
+    try:
+        with apply_configuration(page_tree_maximum_depth=depth + 1):
+            writer._flatten()
+    except RecursionError:
+        # Reported without the (huge) recursion traceback.
+        pytest.fail("_flatten exhausted the interpreter stack", pytrace=False)
+
+    assert writer.flattened_pages is not None
+    assert len(writer.flattened_pages) == 1
+
+
+@pytest.mark.xfail(
+    reason=(
+        "_flatten calls .get_object() on root_object.get('/Pages') without a None "
+        "check, so a catalog without /Pages raises AttributeError instead of PdfReadError."
+    ),
+)
+def test_flatten__missing_pages_entry():
+    # A document catalog without /Pages is malformed. Flattening must raise a
+    # PdfReadError, not an AttributeError from calling .get_object() on None.
+    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
+    del reader.root_object["/Pages"]
+    reader.flattened_pages = None
+
+    with pytest.raises(PdfReadError, match=r"^Invalid object in /Pages$"):
+        list(reader.pages)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "_flatten sets self.flattened_pages before the traversal and appends as it "
+        "goes, so a mid-traversal error leaves a truncated, non-None list that a later "
+        "page access silently serves instead of re-raising."
+    ),
+)
+def test_flatten__error_does_not_leave_a_partial_result():
+    # If flattening raises partway through, the pages collected so far must be
+    # discarded: a later access has to re-raise rather than silently serve a
+    # truncated page list.
+    writer = PdfWriter()
+    good_kids = [
+        writer._add_object(
+            DictionaryObject(
+                {
+                    NameObject("/Type"): NameObject("/Page"),
+                    NameObject("/MediaBox"): RectangleObject([0, 0, 10, 10]),
+                }
+            )
+        )
+        for _ in range(2)
+    ]
+    good_subtree = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Pages"),
+                NameObject("/Kids"): ArrayObject(good_kids),
+                NameObject("/Count"): NumberObject(2),
+            }
+        )
+    )
+    # Second subtree is processed after the first and fails on its /Kids.
+    broken_subtree = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Pages"),
+                NameObject("/Kids"): NumberObject(0),
+                NameObject("/Count"): NumberObject(1),
+            }
+        )
+    )
+    writer.root_object[NameObject("/Pages")] = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Pages"),
+                NameObject("/Kids"): ArrayObject([good_subtree, broken_subtree]),
+                NameObject("/Count"): NumberObject(3),
+            }
+        )
+    )
+
+    writer.flattened_pages = None
+    with pytest.raises(PdfReadError, match=r"^Expected /Kids to be an array, got NumberObject\.$"):
+        writer._flatten()
+    assert writer.flattened_pages is None
+
+    with pytest.raises(PdfReadError, match=r"^Expected /Kids to be an array, got NumberObject\.$"):
+        len(writer.pages)
 
 
 @pytest.mark.enable_socket
@@ -811,8 +975,8 @@ def test_xfa__decompression_limit():
     data.flush()
 
     reader = PdfReader(data)
-    with mock.patch("pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH", 75_000), pytest.raises(
-            expected_exception=LimitReachedError, match=r"^Limit reached while decompressing. 902 bytes remaining.$"
+    with apply_configuration(zlib_maximum_output_length=75_000), pytest.raises(
+            expected_exception=LimitReachedError, match=r"^Limit reached while decompressing\. 902 bytes remaining\.$"
     ):
         _ = reader.xfa
 
@@ -997,8 +1161,425 @@ def test_get_outline__entry_count():
         outline[NameObject("/Next")] = writer._add_object(outlines[index + 1])
         writer._add_object(outline)
 
-    with mock.patch("pypdf._doc_common.OUTLINE_MAX_ENTRIES", 1000), \
+    with apply_configuration(outline_maximum_entries=1000), \
             pytest.raises(
                 expected_exception=LimitReachedError, match=r"^Maximum outline entry limit reached: 1001 > 1000\.$"
             ):
         writer._get_outline()
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        pytest.param(
+            NumberObject(1), "AcroForm /Fields is not an array: 1", id="number"
+        ),
+        pytest.param(
+            TextStringObject("x"), "AcroForm /Fields is not an array: x", id="string"
+        ),
+        pytest.param(
+            DictionaryObject(), "AcroForm /Fields is not an array: {}", id="dictionary"
+        ),
+    ],
+)
+def test_get_fields__fields_is_not_an_array(caplog, fields, expected):
+    """A malformed /Fields raised a TypeError when the loop tried to iterate it."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/AcroForm")] = DictionaryObject(
+        {NameObject("/Fields"): fields}
+    )
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).get_fields() == {}
+    assert expected in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(
+            NumberObject(1), "Viewer preferences are not a dictionary: 1", id="number"
+        ),
+        pytest.param(
+            ArrayObject(), "Viewer preferences are not a dictionary: []", id="array"
+        ),
+        pytest.param(
+            TextStringObject("x"),
+            "Viewer preferences are not a dictionary: x",
+            id="string",
+        ),
+    ],
+)
+def test_viewer_preferences__not_a_dictionary(caplog, value, expected):
+    """A malformed entry raised an AttributeError from the ViewerPreferences init."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/ViewerPreferences")] = value
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).viewer_preferences is None
+    assert expected in caplog.text
+
+
+def test_viewer_preferences__reads_a_well_formed_dictionary():
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.create_viewer_preferences().center_window = True
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).viewer_preferences == {"/CenterWindow": True}
+
+
+@pytest.mark.parametrize(
+    ("first", "expected"),
+    [
+        pytest.param(
+            NumberObject(1), "Outline node is not a dictionary: 1", id="number"
+        ),
+        pytest.param(
+            TextStringObject("x"), "Outline node is not a dictionary: x", id="string"
+        ),
+        pytest.param(ArrayObject(), "Outline node is not a dictionary: []", id="array"),
+    ],
+)
+def test_outline__first_is_not_a_dictionary(caplog, first, expected):
+    """A malformed /First raised a TypeError from the first subscript."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/Outlines")] = DictionaryObject(
+        {NameObject("/First"): first}
+    )
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).outline == []
+    assert expected in caplog.text
+
+
+def test_outline__reads_a_well_formed_outline():
+    writer = PdfWriter()
+    for _ in range(2):
+        writer.add_blank_page(width=72, height=72)
+    writer.add_outline_item("Chapter 1", 0)
+    writer.add_outline_item("Chapter 2", 1)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert [item.title for item in PdfReader(stream).outline] == [
+        "Chapter 1",
+        "Chapter 2",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        pytest.param(
+            "/Dests",
+            NumberObject(1),
+            "Destination tree is not a dictionary: 1",
+            id="number",
+        ),
+        pytest.param(
+            "/Dests",
+            ArrayObject(),
+            "Destination tree is not a dictionary: []",
+            id="array",
+        ),
+        pytest.param(
+            "/Dests",
+            TextStringObject("x"),
+            "Destination tree is not a dictionary: x",
+            id="string",
+        ),
+    ],
+)
+def test_get_named_destinations__tree_is_not_a_dictionary(caplog, key, value, expected):
+    """A malformed name tree raised a TypeError from the first membership test."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject(key)] = value
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).named_destinations == {}
+    assert expected in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        pytest.param(
+            "/Names",
+            NumberObject(5),
+            "Destination tree names are not an array: 5",
+            id="names-number",
+        ),
+        pytest.param(
+            "/Names",
+            TextStringObject("x"),
+            "Destination tree names are not an array: x",
+            id="names-string",
+        ),
+        pytest.param(
+            "/Kids",
+            NumberObject(7),
+            "Destination tree kids are not an array: 7",
+            id="kids-number",
+        ),
+        pytest.param(
+            "/Kids",
+            TextStringObject("y"),
+            "Destination tree kids are not an array: y",
+            id="kids-string",
+        ),
+    ],
+)
+def test_get_named_destinations__node_entry_is_not_an_array(caplog, key, value, expected):
+    """A /Names or /Kids entry that is not an array raised a TypeError from len() or iteration."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/Names")] = DictionaryObject(
+        {NameObject("/Dests"): DictionaryObject({NameObject(key): value})}
+    )
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).named_destinations == {}
+    assert expected in caplog.text
+
+
+def test_get_named_destinations__names_is_not_a_dictionary():
+    """A /Names entry that cannot hold /Dests simply yields no destinations."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/Names")] = NumberObject(1)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).named_destinations == {}
+
+
+def test_get_named_destinations__reads_a_well_formed_tree():
+    writer = PdfWriter()
+    for _ in range(2):
+        writer.add_blank_page(width=72, height=72)
+    writer.add_named_destination("Chapter 1", 0)
+    writer.add_named_destination("Chapter 2", 1)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert sorted(PdfReader(stream).named_destinations) == ["Chapter 1", "Chapter 2"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(NumberObject(1), "Outlines are not a dictionary: 1", id="number"),
+        pytest.param(ArrayObject(), "Outlines are not a dictionary: []", id="array"),
+        pytest.param(
+            TextStringObject("x"), "Outlines are not a dictionary: x", id="string"
+        ),
+    ],
+)
+def test_outline__outlines_entry_is_not_a_dictionary(caplog, value, expected):
+    """A malformed /Outlines raised a TypeError from the /First membership test."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/Outlines")] = value
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).outline == []
+    assert expected in caplog.text
+
+
+@pytest.mark.parametrize(
+    "indirect",
+    [pytest.param(False, id="direct"), pytest.param(True, id="indirect")],
+)
+def test_outline__outlines_entry_is_null(indirect):
+    """A null entry, direct or behind a reference, still yields no outline."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    value = NullObject()
+    writer.root_object[NameObject("/Outlines")] = (
+        writer._add_object(value) if indirect else value
+    )
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).outline == []
+
+
+def test_outline__reads_a_well_formed_outlines_entry():
+    writer = PdfWriter()
+    for _ in range(2):
+        writer.add_blank_page(width=72, height=72)
+    writer.add_outline_item("Chapter 1", 0)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert [item.title for item in PdfReader(stream).outline] == ["Chapter 1"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(NumberObject(1), "Form field is not a dictionary: 1", id="number"),
+        pytest.param(ArrayObject(), "Form field is not a dictionary: []", id="array"),
+        pytest.param(
+            TextStringObject("x"), "Form field is not a dictionary: x", id="string"
+        ),
+    ],
+)
+def test_build_field__entry_is_not_a_dictionary(caplog, value, expected):
+    """A field entry that is not a dictionary raised a TypeError from the /T test."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/AcroForm")] = DictionaryObject(
+        {NameObject("/Fields"): ArrayObject([value])}
+    )
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).get_fields() == {}
+    assert expected in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(NumberObject(1), "AcroForm is not a dictionary: 1", id="number"),
+        pytest.param(ArrayObject(), "AcroForm is not a dictionary: []", id="array"),
+        pytest.param(
+            TextStringObject("x"), "AcroForm is not a dictionary: x", id="string"
+        ),
+    ],
+)
+def test_get_fields__acro_form_is_not_a_dictionary(caplog, value, expected):
+    """A malformed /AcroForm raised a TypeError from the /Fields membership test."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.root_object[NameObject("/AcroForm")] = value
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).get_fields() is None
+    assert expected in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(NumberObject(1), "Ignoring page tree entry that is not a dictionary: 1", id="number"),
+        pytest.param(TextStringObject("x"), "Ignoring page tree entry that is not a dictionary: x", id="string"),
+        pytest.param(ArrayObject(), "Ignoring page tree entry that is not a dictionary: []", id="array"),
+    ],
+)
+def test_flatten__kid_is_not_a_dictionary(caplog, value, expected):
+    """A /Kids entry that is not a dictionary raised a TypeError from the /Type lookup."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    pages = writer.root_object["/Pages"]
+    pages[NameObject("/Kids")] = ArrayObject([*pages["/Kids"], value])
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert len(PdfReader(stream).pages) == 1
+    assert expected in caplog.text
+
+
+def _generate_reader_with_xfa(xfa: PdfObject) -> PdfReader:
+    """A reader whose /AcroForm carries the given /XFA entry."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+
+    acro_form = DictionaryObject()
+    acro_form[NameObject("/XFA")] = xfa
+    writer.root_object[NameObject("/AcroForm")] = writer._add_object(acro_form)
+
+    data = BytesIO()
+    writer.write(data)
+    data.seek(0)
+    return PdfReader(data)
+
+
+@pytest.mark.parametrize(
+    ("xfa", "expected"),
+    [
+        pytest.param(NumberObject(5), "XFA entry is not an array: 5", id="number"),
+        pytest.param(TextStringObject("x"), "XFA entry is not an array: x", id="string"),
+        pytest.param(DictionaryObject(), "XFA entry is not an array: {}", id="dictionary"),
+    ],
+)
+def test_xfa__entry_not_an_array(caplog, xfa, expected):
+    """Iterating a non-array /XFA raised a TypeError or exhausted the iterator."""
+    assert _generate_reader_with_xfa(xfa).xfa == {}
+    assert expected in caplog.text
+
+
+def test_xfa__array_with_a_trailing_tag(caplog):
+    """/XFA holds tag/value pairs; a trailing tag raised StopIteration."""
+    reader = _generate_reader_with_xfa(ArrayObject([TextStringObject("datasets")]))
+
+    assert reader.xfa == {}
+    assert caplog.text == ""
+
+
+def test_flatten__kid_with_unrecognised_type(caplog):
+    """
+    A /Kids entry whose /Type is neither /Pages nor /Page hits neither branch
+    of `if node_type == "/Pages": ... elif node_type == "/Page": ...` in
+    _flatten. Unlike a non-dictionary entry (which is logged and skipped),
+    this one - and anything nested under it - disappears without a warning.
+    """
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+
+    hidden_page = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Page"),
+                NameObject("/MediaBox"): RectangleObject([0, 0, 10, 10]),
+            }
+        )
+    )
+    weird_node = writer._add_object(
+        DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Template"),
+                NameObject("/Kids"): ArrayObject([hidden_page]),
+                NameObject("/Count"): NumberObject(1),
+            }
+        )
+    )
+    pages = writer.root_object["/Pages"]
+    pages[NameObject("/Kids")] = ArrayObject([*pages["/Kids"], weird_node])
+    pages[NameObject("/Count")] = NumberObject(2)
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    reader = PdfReader(stream)
+    assert len(reader.pages) == 1  # this calls '_flatten' internally
+    assert caplog.text == ""
