@@ -1,5 +1,86 @@
 # CHANGELOG
 
+## Version 6.21.2, 2026-10-21
+
+### Security (SEC)
+- Avoid repeated full file loads (#4240)
+- Limit size of standard xref table (#4239)
+
+### Bug Fixes (BUG)
+- Decode UniGB-UTF16 CMaps as UTF-16BE (#4231)
+- Keep 8-bit DeviceRGB image mode (#4230)
+- Preserve all annotation quadrilaterals when merging pages (#4223)
+
+### Robustness (ROB)
+- Multiple fixes
+
+[Full Changelog](https://github.com/py-pdf/pypdf/compare/6.21.1...6.21.2)
+
+## Version 6.21.1, 2026-10-17
+
+### Security (SEC)
+- Only open /DCTDecode image data with the Pillow JPEG plugin (#4222)
+
+[Full Changelog](https://github.com/py-pdf/pypdf/compare/6.21.0...6.21.1)
+
+## Version 6.21.0, 2026-10-16
+
+### Security (SEC)
+- Improve performance and limit field work (#4219)
+- Limit stream parsing work (#4218)
+
+### New Features (ENH)
+- Allow custom fit modes for named destinations (#4181)
+
+### Bug Fixes (BUG)
+- Treat NUL as whitespace in ArrayObject (#4198)
+- Avoid overwriting unread objects in add_form_topname (#4190)
+- Read an indirect page box on a writer page (#4179)
+
+[Full Changelog](https://github.com/py-pdf/pypdf/compare/6.20.1...6.21.0)
+
+## Version 6.20.1, 2026-10-12
+
+### Security (SEC)
+- Prevent cyclic tree handling (#4188)
+
+### Bug Fixes (BUG)
+- Only read the color operator from a text field's default appearance (#4158)
+
+[Full Changelog](https://github.com/py-pdf/pypdf/compare/6.20.0...6.20.1)
+
+## Version 6.20.0, 2026-10-09
+
+### Security (SEC)
+- Limit work per stream (filter count, accumulated decoding work) (#4173)
+
+### New Features (ENH)
+- Add support for BrotliDecode filter (PDF 2.0) (#4168)
+
+### Performance Improvements (PI)
+- Parse an embedded CFF font program once per stream (#4164)
+- Parse numbers, indirect references, names and nulls faster (#4148)
+- Do not inherit PdfObject from a Protocol (#4149)
+- Speed up cloning direct objects (#4152)
+
+### Bug Fixes (BUG)
+- Report the correct page number for identical pages (#4154)
+- Decrypt the XMP metadata stream unless /EncryptMetadata is false (#4151)
+
+### Robustness (ROB)
+- Accept an %%EOF marker that is not at the start of a line (#4136)
+- Font / _cmapy.py: More robust guards around fontTools (#4157)
+- Flatten the page tree iteratively (#4107)
+- Ignore invalid character codes for TrueType and Type1 font widths (#4117)
+- Restrict values to allowed range in CCITTFaxDecode (#4115)
+- Drop a /Kids entry resolving to null instead of raising a cycle error (#4108)
+
+### Developer Experience (DEV)
+- Declare official support for Python 3.15
+- Declare protocol data members on PdfReader and PdfWriter (#4106)
+
+[Full Changelog](https://github.com/py-pdf/pypdf/compare/6.19.0...6.20.0)
+
 ## Version 6.19.0, 2026-09-16
 
 ### Security (SEC)

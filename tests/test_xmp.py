@@ -119,6 +119,64 @@ def test_converter_date():
     assert date == datetime(2021, 4, 28, 15, 23, 1)
 
 
+@pytest.mark.parametrize(
+    ("value", "date_parts"),
+    [
+        ("0000-01-01T00:00:00Z", (0, 1, 1)),
+        ("2024-13-01T00:00:00Z", (2024, 13, 1)),
+        ("2024-02-31T10:00:00Z", (2024, 2, 31, 10)),
+        ("2024-01-01T24:00:00Z", (2024, 1, 1, 24)),
+        ("2024-01-01T00:60:00Z", (2024, 1, 1, 0, 60)),
+        ("2024-01-01T00:00:60.123456Z", (2024, 1, 1, 0, 0, 60, 123456)),
+        ("2024-02-31T10:00:00+00:30", (2024, 2, 31, 10)),
+        ("2024-02-31", (2024, 2, 31)),
+    ],
+)
+def test_converter_date_out_of_range(value, date_parts):
+    """Invalid timestamps retain their value and datetime's specific reason."""
+    with pytest.raises(ValueError) as datetime_exc:
+        datetime(*date_parts)
+    with pytest.raises(ValueError) as exc:
+        pypdf.xmp._converter_date(value)
+    assert str(exc.value) == f"Invalid date {value!r}: {datetime_exc.value}"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2024-01-02T03:04:05+00:15", datetime(2024, 1, 2, 2, 49, 5)),
+        ("2024-01-02T03:04:05+00:30", datetime(2024, 1, 2, 2, 34, 5)),
+        ("2024-01-02T03:04:05+00:45", datetime(2024, 1, 2, 2, 19, 5)),
+        ("2024-01-02T03:04:05-00:30", datetime(2024, 1, 2, 3, 34, 5)),
+        ("2024-01-02T03:04:05+01:30", datetime(2024, 1, 2, 1, 34, 5)),
+        ("2024-01-02T03:04:05-01:30", datetime(2024, 1, 2, 4, 34, 5)),
+        ("2024-01-01T00:15:00+00:30", datetime(2023, 12, 31, 23, 45)),
+        ("2024-01-01T23:45:00-00:30", datetime(2024, 1, 2, 0, 15)),
+    ],
+)
+def test_converter_date_minute_offsets(value, expected):
+    """Minute timezone offsets are applied with their stated sign."""
+    assert pypdf.xmp._converter_date(value) == expected
+
+
+def test_read_xmp_date_with_positive_zero_hour_offset():
+    """A PDF's XMP creation date is converted to the correct UTC time."""
+    xmp = XmpInformation.create()
+    xmp.xmp_create_date = datetime(2024, 1, 2, 3, 4, 5)
+    xmp.stream.set_data(
+        xmp.stream.get_data().replace(
+            b"2024-01-02T03:04:05.000000Z", b"2024-01-02T03:04:05+00:30"
+        )
+    )
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.xmp_metadata = xmp
+    output = BytesIO()
+    writer.write(output)
+    reader = PdfReader(output)
+    assert reader.xmp_metadata.xmp_create_date == datetime(2024, 1, 2, 2, 34, 5)
+
+
 def test_modify_date():
     """
     xmp_modify_date is extracted correctly.
@@ -407,6 +465,20 @@ def test_xmp_information__create():
     assert xmp.dc_description == {}
     assert xmp.xmp_create_date is None
     assert xmp.pdf_producer is None
+
+
+def test_xmp_information__does_not_inherit_from_protocol():
+    """
+    XmpInformation does not inherit from XmpInformationProtocol.
+
+    Inheriting from a Protocol would make typing._ProtocolMeta the metaclass, see
+    #2136. mypy checks that XmpInformation satisfies the protocol where
+    DictionaryObject.xmp_metadata returns it.
+    """
+    xmp = XmpInformation.create()
+    assert xmp.get_object() is xmp
+    assert xmp.hash_value().startswith(b"XmpInformation:")
+    assert type(XmpInformation) is type
 
 
 def test_xmp_information__set_dc_title():

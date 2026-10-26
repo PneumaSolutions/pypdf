@@ -1,7 +1,6 @@
 """Test the pypdf._page module."""
 import json
 import math
-import os
 import re
 import shutil
 import subprocess
@@ -17,7 +16,7 @@ import pytest
 
 from pypdf import PdfReader, PdfWriter, Transformation
 from pypdf._page import PageObject, _get_fonts_walk
-from pypdf.annotations import Polygon
+from pypdf.annotations import Highlight, Polygon
 from pypdf.constants import PageAttributes
 from pypdf.constants import PageAttributes as PG
 from pypdf.errors import PdfReadError, PdfReadWarning, PyPdfError
@@ -34,7 +33,7 @@ from pypdf.generic import (
     TextStringObject,
 )
 
-from . import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url, normalize_warnings
+from . import RESOURCE_ROOT, SAMPLE_ROOT, get_data_from_url, get_subprocess_environment, normalize_warnings
 from .test_images import image_similarity
 from .utils import extract_cell_text, extract_table, extract_text_and_rectangles
 
@@ -318,6 +317,101 @@ def test_compress_content_streams(pdf_path, password):
     # PdfWriter not possible
     with pytest.raises(ValueError):
         reader.pages[0].compress_content_streams()
+
+
+def test_page_number_of_identical_pages():
+    """
+    Pages which only differ in their object number must still report their
+    own position in the document.
+
+    `PageObject.page_number` used to look the page up with `list.index`, which
+    compares with `==`. Two pages with identical content therefore compared
+    equal, the first match won, and every page but the first reported 0.
+    """
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=200, height=200)
+
+    for number, page in enumerate(writer.pages):
+        assert number == page.page_number
+        assert number == writer.get_page_number(page)
+
+    # The same for a reader, where the pages are read back from the file.
+    output = BytesIO()
+    writer.write(output)
+    output.seek(0)
+    for number, page in enumerate(PdfReader(output).pages):
+        assert number == page.page_number
+
+
+def test_page_number_of_named_destination():
+    """A named destination has to resolve to the page it points at."""
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=200, height=200)
+    writer.add_named_destination("chapter2", 2)
+
+    destination = writer.named_destinations["chapter2"]
+    assert writer.get_destination_page_number(destination) == 2
+
+
+def test_compress_content_streams_releases_replaced_streams():
+    """The streams being replaced must not be kept in the output. See #4085."""
+    def create_stamped_writer() -> PdfWriter:
+        writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+        stamp = PdfReader(RESOURCE_ROOT / "crazyones.pdf").pages[0]
+        for page in writer.pages:
+            page.merge_page(stamp)
+        return writer
+
+    def write(writer: PdfWriter) -> bytes:
+        output = BytesIO()
+        writer.write(output)
+        return output.getvalue()
+
+    writer = create_stamped_writer()
+    # Merging makes `/Contents` an indirect reference to an array, which is what
+    # `replace_contents()` failed to resolve before checking its type.
+    contents = writer.pages[0].raw_get(PG.CONTENTS)
+    assert isinstance(contents, IndirectObject)
+    assert isinstance(contents.get_object(), ArrayObject)
+    replaced = [
+        reference.idnum for page in writer.pages for reference in page[PG.CONTENTS]
+    ]
+
+    for page in writer.pages:
+        page.compress_content_streams()
+
+    # The streams the compressed one replaces have been released ...
+    assert all(isinstance(writer._objects[idnum - 1], NullObject) for idnum in replaced)
+    compressed, uncompressed = write(writer), write(create_stamped_writer())
+    # ... thus the output is smaller than without compressing at all.
+    assert len(compressed) < len(uncompressed)
+    # The content itself is unchanged.
+    assert PdfReader(BytesIO(compressed)).pages[0].extract_text() == (
+        PdfReader(BytesIO(uncompressed)).pages[0].extract_text()
+    )
+
+
+def test_replace_contents_skips_direct_array_entries():
+    """Entries of a `/Contents` array which are not indirect references must be skipped.
+
+    Such entries are not part of the writer's object list, so handing one to
+    `PdfWriter._replace_object()` raises `TypeError` rather than the `ValueError`
+    the surrounding handler covers. See #4085.
+    """
+    writer = PdfWriter(clone_from=RESOURCE_ROOT / "crazyones.pdf")
+    page = writer.pages[0]
+
+    released = writer._add_object(ContentStream(None, writer))
+    direct = ContentStream(None, writer)
+    assert not isinstance(direct, IndirectObject)
+    page[NameObject(PG.CONTENTS)] = ArrayObject([direct, released])
+
+    page.replace_contents(ContentStream(None, writer))
+
+    # The indirect entry has been released, the direct one silently ignored.
+    assert isinstance(writer._objects[released.idnum - 1], NullObject)
 
 
 def test_page_properties():
@@ -804,7 +898,7 @@ def test_empty_password_1088():
     len(reader.pages)
 
 
-@pytest.mark.enable_socket
+@pytest.mark.samples
 def test_old_habibi():
     # this habibi has multiple characters associated with the h
     reader = PdfReader(SAMPLE_ROOT / "015-arabic/habibi.pdf")
@@ -871,6 +965,55 @@ def test_merge_page_with_annotations():
 
     page0.merge_page(page1)
     assert len(page0.annotations) == 1
+
+
+@pytest.mark.parametrize(
+    ("quad_count", "transformation", "expected"),
+    [
+        (1, None, [10, 70, 90, 70, 10, 60, 90, 60]),
+        (2, None, [10, 70, 90, 70, 10, 60, 90, 60, 10, 50, 90, 50, 10, 40, 90, 40]),
+        (
+            2,
+            Transformation().translate(200, 0),
+            [210, 70, 290, 70, 210, 60, 290, 60, 210, 50, 290, 50, 210, 40, 290, 40],
+        ),
+        (
+            2,
+            Transformation().rotate(90).translate(200, 0),
+            [130, 10, 130, 90, 140, 10, 140, 90, 150, 10, 150, 90, 160, 10, 160, 90],
+        ),
+    ],
+    ids=["single-quad", "multiple-quads", "translated", "rotated"],
+)
+def test_merge_page_preserves_annotation_quad_points(quad_count, transformation, expected):
+    quad_points = [10, 70, 90, 70, 10, 60, 90, 60, 10, 50, 90, 50, 10, 40, 90, 40][
+        : 8 * quad_count
+    ]
+    source = PdfWriter()
+    source.add_blank_page(width=200, height=200)
+    source.add_annotation(
+        0,
+        Highlight(
+            rect=(10, 40, 90, 70),
+            quad_points=ArrayObject(FloatObject(value) for value in quad_points),
+        ),
+    )
+    source_stream = BytesIO()
+    source.write(source_stream)
+    source_page = PdfReader(source_stream).pages[0]
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=400, height=200)
+    if transformation is None:
+        page.merge_page(source_page)
+    else:
+        page.merge_transformed_page(source_page, transformation)
+
+    output = BytesIO()
+    writer.write(output)
+    annotation = PdfReader(output).pages[0]["/Annots"][0].get_object()
+    assert annotation["/QuadPoints"] == pytest.approx(expected)
+    assert source_page["/Annots"][0].get_object()["/QuadPoints"] == quad_points
 
 
 def test_merge_page_reproducible_with_proc_set():
@@ -1517,9 +1660,6 @@ def test_merge_page__coverage():
 
 @pytest.mark.enable_socket
 def test_importing_without_pillow(tmp_path):
-    env = os.environ.copy()
-    env["COVERAGE_PROCESS_START"] = "pyproject.toml"
-
     source_file = tmp_path / "script.py"
     source_file.write_text(
         """
@@ -1533,14 +1673,10 @@ print(pil_not_imported)
 """
     )
 
-    try:
-        env["PYTHONPATH"] = "." + os.pathsep + env["PYTHONPATH"]
-    except KeyError:
-        env["PYTHONPATH"] = "."
     result = subprocess.run(  # noqa: S603  # We have the control here.
         [sys.executable, source_file],
         capture_output=True,
-        env=env,
+        env=get_subprocess_environment(),
     )
     assert result.returncode == 0
     assert result.stdout.replace(b"\r\n", b"\n") == b"True\n"
@@ -1590,6 +1726,24 @@ def test_get_rectangle__value_is_not_an_array(value, expected):
         ValueError, match=f"Expected an array of four values for /MediaBox, {expected}"
     ):
         _ = PdfReader(stream).pages[0].mediabox
+
+
+def test_get_rectangle__indirect_box_on_a_writer_page():
+    """An indirect page box on a writer page can be read and scaled."""
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=100, height=200)
+    page[NameObject("/MediaBox")] = writer._add_object(RectangleObject([0, 0, 100, 200]))
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    writer = PdfWriter()
+    writer.append(PdfReader(stream))
+    page = writer.pages[0]
+    assert page.mediabox == RectangleObject([0, 0, 100, 200])
+
+    page.scale_by(0.5)
+    assert page.mediabox == RectangleObject([0, 0, 50, 100])
 
 
 @pytest.mark.parametrize(
@@ -1709,6 +1863,44 @@ def test_extract_text__resources_is_null(caplog):
     assert caplog.text == ""
 
 
+@pytest.mark.parametrize("extraction_mode", ["plain", "layout"])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param(NumberObject(1), "Font resources are not a dictionary: 1", id="number"),
+        pytest.param(TextStringObject("x"), "Font resources are not a dictionary: x", id="string"),
+        pytest.param(ArrayObject(), "Font resources are not a dictionary: []", id="array"),
+    ],
+)
+def test_extract_text__font_resources_not_a_dictionary(caplog, value, expected, extraction_mode):
+    """A /Font entry that is not a dictionary is malformed: no text, and a warning."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.pages[0].replace_contents(ContentStream(None, writer))
+    writer.pages[0][NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): value})
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).pages[0].extract_text(extraction_mode=extraction_mode) == ""
+    assert expected in caplog.text
+
+
+@pytest.mark.parametrize("extraction_mode", ["plain", "layout"])
+def test_extract_text__font_resources_is_null(caplog, extraction_mode):
+    """A null /Font is missing rather than malformed: no text, no warning."""
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.pages[0].replace_contents(ContentStream(None, writer))
+    writer.pages[0][NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): NullObject()})
+    stream = BytesIO()
+    writer.write(stream)
+    stream.seek(0)
+
+    assert PdfReader(stream).pages[0].extract_text(extraction_mode=extraction_mode) == ""
+    assert caplog.text == ""
+
+
 def test_extract_text__resources_is_a_dictionary():
     """The regular path: a proper /Resources still yields its text."""
     reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
@@ -1716,3 +1908,25 @@ def test_extract_text__resources_is_a_dictionary():
 
     assert isinstance(page["/Resources"].get_object(), DictionaryObject)
     assert "crazy ones" in page.extract_text()
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        # /Resources present but ColorSpace entry missing for the custom name
+        pytest.param(
+            DictionaryObject({NameObject("/ColorSpace"): DictionaryObject({})}),
+            id="with-resources-no-colorspace",
+        ),
+        # /Resources absent entirely
+        pytest.param(None, id="without-resources"),
+    ],
+)
+def test_translate_value_inline_image_colorspace_not_found(resources):
+    """Raise PdfReadError when a custom NameObject ColorSpace can't be resolved."""
+    page = PageObject()
+    if resources is not None:
+        page[NameObject("/Resources")] = resources
+    custom_name = NameObject("/CustomCS")
+    with pytest.raises(PdfReadError, match=r"^Cannot find resource entry .+ for .+$"):
+        page._translate_value_inline_image("/CS", custom_name)

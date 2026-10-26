@@ -136,10 +136,10 @@ jobs:
 
   tests:
     name: "pytest on ${{ matrix.python-version }} (crypto-lib: ${{ matrix.use-crypto-lib }})"
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-26.04' }}
     strategy:
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14', 'pypy3.11']
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14', '3.15', 'pypy3.11-7.3.23']
         use-crypto-lib: ['cryptography']
         include:
           - python-version: '3.9'
@@ -234,7 +234,7 @@ jobs:
       run: mv .coverage ".coverage.$RANDOM"
       if: ${{ !startsWith(matrix.python-version, 'pypy') }}
     - name: Upload coverage data
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       if: ${{ !startsWith(matrix.python-version, 'pypy') }}
       with:
         name: coverage-data.${{ matrix.python-version }}-${{ matrix.use-crypto-lib }}
@@ -244,7 +244,7 @@ jobs:
 
   codestyle:
     name: Check code style issues
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
     - name: Checkout Code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -333,7 +333,7 @@ jobs:
 
       - run: python -m pip install --upgrade coverage[toml]
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: coverage-data*
           merge-multiple: true
@@ -341,10 +341,10 @@ jobs:
       - name: Check Number of Downloaded Files
         run: |
           downloaded_files_count=$(find \.coverage* -type f | wc -l)
-          if [ $downloaded_files_count -eq 8 ]; then
-            echo "The expected number of files (8) were downloaded."
+          if [ $downloaded_files_count -eq 9 ]; then
+            echo "The expected number of files (9) were downloaded."
           else
-            echo "ERROR: Expected 8 files, but found $downloaded_files_count files."
+            echo "ERROR: Expected 9 files, but found $downloaded_files_count files."
             exit 1
           fi
 
@@ -353,7 +353,7 @@ jobs:
           python -m coverage combine
           python -m coverage xml
       - name: Upload Coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml

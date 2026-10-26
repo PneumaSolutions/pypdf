@@ -32,7 +32,10 @@ from pypdf.generic import (
     DictionaryObject,
     IndirectObject,
     NameObject,
+    NullObject,
     NumberObject,
+    PdfObject,
+    StreamObject,
     TextStringObject,
 )
 
@@ -430,6 +433,49 @@ def test_startxref_corrupt_trailing_pointer(caplog):
         PdfReader(io.BytesIO(pdf_data), strict=True)
 
 
+@pytest.mark.parametrize("value", [b"\xdf", b"", b" ", b"+", b"-", b"++1", b"--1", b"1x", b"1__0", b"_1", b"1_"])
+def test_startxref_same_line_garbage_raises_pdfreaderror(value):
+    """Corrupt bytes after startxref must raise PdfReadError, not ValueError (#4208)."""
+    data = b"startxref" + value + b"\nf\n6\n%"
+    with pytest.raises(PdfReadError, match="startxref not found"):
+        PdfReader(BytesIO(data))
+
+    # Primary parser path: startxref and garbage share the line above %%EOF
+    data = b"%PDF-1.0\nstartxref" + value + b"\n%%EOF\n"
+    with pytest.raises(PdfReadError, match="startxref not found"):
+        PdfReader(BytesIO(data))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(b"123", 123), (b"+123", 123), (b"-123", -123), (b"0", 0), (b"1_234", 1234)],
+)
+def test_startxref_same_line_integer_values(value, expected, caplog):
+    """Signed offsets and digit separators retain their existing parsing behavior."""
+    data = b"\nstartxref " + value
+    reader = PdfReader.__new__(PdfReader)
+    stream = BytesIO(data)
+    stream.seek(0, 2)
+    assert reader._find_startxref_pos(stream) == expected
+    assert caplog.messages == ["startxref on same line as offset"]
+    stream.seek(0, 2)
+    assert reader._find_previous_startxref_pos(stream) == expected
+
+
+def test_startxref_same_line_integer_conversion_limit():
+    """Oversized same-line offsets raise PdfReadError instead of ValueError."""
+    limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+    if not limit:
+        pytest.skip("Python integer conversion limit is disabled")
+    data = b"%PDF-1.0\nstartxref " + b"1" * (limit + 1) + b"\n%%EOF\n"
+    with pytest.raises(PdfReadError, match="startxref not found"):
+        PdfReader(BytesIO(data))
+    stream = BytesIO(data)
+    stream.seek(0, 2)
+    with pytest.raises(PdfReadError, match="startxref not found"):
+        PdfReader._find_previous_startxref_pos(stream)
+
+
 def test_find_previous_startxref_pos_recovery_variants():
     """Cover the backward-scan branches of _find_previous_startxref_pos (#3238)."""
 
@@ -443,6 +489,10 @@ def test_find_previous_startxref_pos_recovery_variants():
 
     # Keyword and offset share a line
     assert scan(b"startxref 6789\ngarbage\n") == 6789
+
+    # Garbage on the same line as the keyword must not leak ValueError (#4208)
+    with pytest.raises(PdfReadError, match="startxref not found"):
+        scan(b"startxref\xdf\nf\n6\n%")
 
     # A startxref keyword with no numeric offset above it cannot be recovered
     with pytest.raises(PdfReadError, match="startxref not found"):
@@ -502,6 +552,65 @@ def test_duplicate_eof_markers_without_startxref(pdf_data):
     """A run of %%EOF markers with no offset above it is still reported as broken."""
     with pytest.raises(PdfReadError, match="startxref not found"):
         PdfReader(BytesIO(pdf_data))
+
+
+@pytest.mark.parametrize(
+    ("after_startxref", "before_marker", "after_marker", "expected_warnings"),
+    [
+        pytest.param(
+            b" ", b"", b"", ["EOF marker not at start of line", "startxref on same line as offset"],
+            id="offset-on-startxref-line",
+        ),
+        pytest.param(
+            b"\n", b"", b"", ["EOF marker not at start of line"],
+            id="offset-on-own-line",
+        ),
+        pytest.param(
+            b" ", b"", b"\n", ["EOF marker not at start of line", "startxref on same line as offset"],
+            id="offset-on-startxref-line-newline-after-marker",
+        ),
+        pytest.param(
+            b"\n", b"", b"\n", ["EOF marker not at start of line"],
+            id="offset-on-own-line-newline-after-marker",
+        ),
+        pytest.param(
+            b"\r\n", b"", b"\r\n", ["EOF marker not at start of line"],
+            id="crlf",
+        ),
+        pytest.param(
+            b"\n", b" ", b"", ["EOF marker not at start of line"],
+            id="space-before-marker",
+        ),
+        pytest.param(
+            b"\n", b"\n  ", b"", [],
+            id="marker-on-own-line-after-indentation",
+        ),
+    ],
+)
+@pytest.mark.parametrize("strict", [False, True], ids=["non-strict", "strict"])
+def test_eof_marker_not_at_line_start(
+    caplog, after_startxref, before_marker, after_marker, expected_warnings, strict
+):
+    """%%EOF glued to the startxref offset is still the trailer (#4127)."""
+    writer = PdfWriter()
+    writer.add_blank_page(200, 200)
+    buffer = BytesIO()
+    writer.write(buffer)
+    data = buffer.getvalue()
+    expected = PdfReader(BytesIO(data))._startxref
+
+    start = data.rfind(b"startxref")
+    offset = data[start:].split()[1]
+    pdf_data = (
+        data[:start] + b"startxref" + after_startxref + offset
+        + before_marker + b"%%EOF" + after_marker
+    )
+
+    caplog.clear()
+    reader = PdfReader(BytesIO(pdf_data), strict=strict)
+    assert len(reader.pages) == 1
+    assert reader._startxref == expected
+    assert [warning for warning in normalize_warnings(caplog.text) if warning] == expected_warnings
 
 
 @pytest.mark.parametrize(
@@ -1157,6 +1266,12 @@ def test_read_not_binary_mode(caplog):
     assert normalize_warnings(caplog.text) == [msg]
 
 
+def test_invalid_unicode_stream():
+    data = io.TextIOWrapper(io.BytesIO(b"\xff" * 10), encoding="utf-8")
+    with pytest.raises(io.UnsupportedOperation):
+        PdfReader(data)
+
+
 @pytest.mark.enable_socket
 @pytest.mark.skipif(not HAS_AES, reason="No AES algorithm available")
 def test_read_form_416():
@@ -1192,6 +1307,150 @@ def test_form_topname_with_and_without_acroform(caplog):
     ] = DictionaryObject()
     r.add_form_topname("top")
     assert "has a non-expected parent" in caplog.text
+
+
+_TOPNAME_CONTENT = b"BT /F1 12 Tf 20 100 Td (Example) Tj ET\n"
+
+
+def _make_form_topname_reader(font_id: int = 6, generation: int = 0, compressed: bool = False) -> PdfReader:
+    def make_stream(data: bytes, attributes: bytes = b"") -> bytes:
+        return b"<< /Length %d " % len(data) + attributes + b" >>\nstream\n" + data + b"\nendstream"
+
+    font_ref = f"{font_id} {generation} R".encode()
+    objects = {
+        2: b"<< /Type /Catalog /Pages 3 0 R /AcroForm 5 0 R >>",
+        3: b"<< /Type /Pages /Kids [4 0 R] /Count 1 >>",
+        4: (
+            b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 200 200] /Annots 8 0 R /Contents 10 0 R "
+            b"/Resources << /Font << /F1 " + font_ref + b" >> >> >>"
+        ),
+        5: (
+            b"<< /Fields [7 0 R] /DA (/F1 12 Tf 0 g) /NeedAppearances true /DR << /Font << /F1 "
+            + font_ref
+            + b" >> >> >>"
+        ),
+        font_id: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        7: (b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (value) /V (example) /Rect [20 20 180 40] /P 4 0 R >>"),
+        8: b"[7 0 R 9 0 R]",
+        9: b"<< /Type /Annot /Subtype /Text /Rect [100 100 120 120] /Contents (note) /P 4 0 R >>",
+        10: make_stream(FlateDecode.encode(_TOPNAME_CONTENT), b"/Filter /FlateDecode"),
+    }
+    if compressed:
+        assert generation == 0
+        header = f"{font_id} 0 ".encode()
+        objects[11] = make_stream(header + objects.pop(font_id), b"/Type /ObjStm /N 1 /First %d" % len(header))
+    data = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    entries = {}
+    for number, body in objects.items():
+        object_generation = generation if number == font_id else 0
+        entries[number] = (1, len(data), object_generation)
+        data.extend(f"{number} {object_generation} obj\n".encode() + body + b"\nendobj\n")
+    if compressed:
+        entries[font_id] = (2, 11, 0)
+    # A low-numbered xref stream leaves higher resource IDs unread after initialization.
+    xref_offset = len(data)
+    entries[1] = (1, xref_offset, 0)
+    size = max(entries) + 1
+    free_ids = [number for number in range(size) if number not in entries]
+    for number, following in zip(free_ids, [*free_ids[1:], 0]):
+        entries[number] = (0, following, 65535 if number == 0 else 0)
+    xref = b"".join(struct.pack(">BIH", *entries[number]) for number in range(size))
+    data.extend(b"1 0 obj\n" + make_stream(xref, b"/Type /XRef /Root 2 0 R /Size %d /W [1 4 2]" % size) + b"\nendobj\n")
+    data.extend(f"startxref\n{xref_offset}\n%%EOF\n".encode())
+    return PdfReader(BytesIO(data), strict=True)
+
+
+def _assert_topname_resources(reader: PdfReader) -> None:
+    page = reader.pages[0]
+    font = page["/Resources"]["/Font"]["/F1"]
+    assert font["/Type"] == "/Font"
+    assert font["/Subtype"] == "/Type1"
+    assert font["/BaseFont"] == "/Helvetica"
+    contents = page["/Contents"]
+    assert isinstance(contents, StreamObject)
+    assert contents._data == FlateDecode.encode(_TOPNAME_CONTENT)
+    assert contents.get_data() == _TOPNAME_CONTENT
+    annotations = page["/Annots"]
+    assert isinstance(annotations, ArrayObject)
+    assert len(annotations) == 2
+    field, note = (entry.get_object() for entry in annotations)
+    assert field["/T"] == "value"
+    assert field["/V"] == "example"
+    assert note["/Subtype"] == "/Text"
+    assert note["/Contents"] == "note"
+    assert field.raw_get("/P") == note.raw_get("/P") == page.indirect_reference
+
+
+@pytest.mark.parametrize(
+    ("priming", "font_id", "generation", "compressed"),
+    [
+        ("none", 6, 0, False),
+        ("fields", 6, 0, False),
+        ("annotations", 6, 0, False),
+        ("none", 42, 0, False),
+        ("none", 42, 7, False),
+        ("none", 12, 0, True),
+    ],
+    ids=["unread-font", "unread-annots", "unread-content", "sparse", "nonzero-generation", "object-stream"],
+)
+def test_form_topname_preserves_unread_objects(priming, font_id, generation, compressed, caplog):
+    """Repeated form grouping preserves unread resources and field ancestry through serialization."""
+    _assert_topname_resources(_make_form_topname_reader(font_id, generation, compressed))
+    reader = _make_form_topname_reader(font_id, generation, compressed)
+    if priming == "fields":
+        assert reader.get_fields()["value"]["/V"] == "example"
+    elif priming == "annotations":
+        for annotation in reader.pages[0]["/Annots"]:
+            annotation.get_object()
+    assert (generation, font_id) not in reader.resolved_objects
+    if compressed:
+        assert reader.xref_objStm == {font_id: (11, 0)}
+    source_size = reader.trailer["/Size"]
+    inner = reader.add_form_topname("inner")
+    cached_after = set(reader.resolved_objects)
+    _assert_topname_resources(reader)
+    assert (generation, font_id) not in cached_after
+    assert inner.indirect_reference.idnum == source_size
+    outer = reader.add_form_topname("outer")
+    assert outer.indirect_reference.idnum == source_size + 1
+    assert outer["/Kids"][0].get_object() is inner
+    assert inner["/Parent"] is outer
+    writer = PdfWriter()
+    writer.append(reader)
+    output = BytesIO()
+    writer.write(output)
+    for document in (reader, PdfReader(output, strict=True)):
+        _assert_topname_resources(document)
+        assert document.get_fields()["outer.inner.value"]["/V"] == "example"
+        field = document.pages[0]["/Annots"][0].get_object()
+        assert field["/Parent"]["/T"] == "inner"
+        assert field["/Parent"]["/Parent"]["/T"] == "outer"
+    assert not caplog.text
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+@pytest.mark.parametrize(
+    ("size", "cached_generation", "expected_id"),
+    [(None, None, 43), (1, None, 43), (100, None, 100), (1, 0, 201), (1, 7, 201)],
+    ids=["missing-size", "underreported-size", "declared-range", "cached-object", "cached-nonzero-generation"],
+)
+def test_form_topname_allocation_bounds(compressed, size, cached_generation, expected_id):
+    """New parent IDs respect file bounds and cached allocations despite missing or underreported /Size."""
+    reader = _make_form_topname_reader(42, 0 if compressed else 7, compressed)
+    # Alter parsed metadata separately from the valid PDF fixtures above.
+    del reader.trailer["/Size"]
+    if size is not None:
+        reader.trailer[NameObject("/Size")] = NumberObject(size)
+    cached = DictionaryObject({NameObject("/Marker"): TextStringObject("example")})
+    if cached_generation is not None:
+        reader.cache_indirect_object(cached_generation, 200, cached)
+    parent = reader.add_form_topname("top")
+    assert parent.indirect_reference.idnum == expected_id
+    assert parent.indirect_reference.generation == 0
+    assert reader.get_object(parent.indirect_reference) is parent
+    if cached_generation is not None:
+        assert reader.get_object(cached.indirect_reference) is cached
+    _assert_topname_resources(reader)
 
 
 @pytest.mark.enable_socket
@@ -2083,6 +2342,57 @@ def test_repair_root(caplog):
     )
 
 
+def _generate_pdf_with_root(root_body: bytes, *, with_catalog: bool = False) -> bytes:
+    """Build a minimal document whose ``/Root`` points at ``root_body``."""
+    objects = [
+        b"1 0 obj\n" + root_body + b"\nendobj\n",
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n",
+    ]
+    if with_catalog:
+        objects.append(b"4 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+
+    data = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for obj in objects:
+        offsets.append(len(data))
+        data += obj
+    xref_offset = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        data += b"%010d 00000 n \n" % offset
+    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1, xref_offset
+    )
+    return bytes(data)
+
+
+@pytest.mark.parametrize(
+    "root_body",
+    [b"42", b"[1 2 3]", b"(hello)", b"/Catalog", b"[/Pages]", b"(x /Pages y)"],
+    ids=["number", "array", "string", "name", "array-with-pages", "string-with-pages"],
+)
+def test_root_object__not_a_dictionary(caplog, root_body):
+    """A ``/Root`` which does not resolve to a dictionary cannot be used as the catalog."""
+    reader = PdfReader(BytesIO(_generate_pdf_with_root(root_body)))
+    with pytest.raises(PdfReadError, match=r"^Cannot find Root object in pdf$"):
+        _ = reader.root_object
+    assert all(
+        message in caplog.text
+        for message in (
+            "Invalid Root object in trailer",
+            'Searching object with "/Catalog" key',
+        )
+    )
+
+    # A catalog elsewhere in the document is still being picked up.
+    caplog.clear()
+    reader = PdfReader(BytesIO(_generate_pdf_with_root(root_body, with_catalog=True)))
+    assert reader.root_object["/Type"] == "/Catalog"
+    assert len(reader.pages) == 1
+    assert "Root found at IndirectObject(4, 0," in caplog.text
+
+
 @pytest.mark.enable_socket
 def test_issue3151(caplog):
     """Tests for #3151"""
@@ -2092,6 +2402,36 @@ def test_issue3151(caplog):
     assert len(reader.pages) == 742
 
 
+def test_negative_startxref_is_treated_as_zero(caplog):
+    """A negative startxref pointer (the uncovered variant of #3151) is
+    repaired like the zero case of #3157 instead of leaking a ValueError
+    from a negative seek.
+    """
+    writer = PdfWriter()
+    writer.add_blank_page(100, 100)
+    buf = BytesIO()
+    writer.write(buf)
+    data = buf.getvalue()
+    idx = data.rfind(b"startxref")
+    num = data[idx : data.rfind(b"%%EOF")].split(b"\n")[1].strip()
+    negative_data = data[:idx] + b"startxref\n-" + num + b"\n%%EOF" + data[data.rfind(b"%%EOF") + 5 :]
+
+    # A corrupted (negative) startxref is recovered to a single page.
+    reader = PdfReader(BytesIO(negative_data))
+    assert len(reader.pages) == 1
+    assert caplog.messages == [
+        f"Negative startxref pointer (-{int(num)}), treating it as zero.",
+        "incorrect startxref pointer(4)",
+        "parsing for Object Streams",
+    ]
+
+    # A healthy startxref emits no warnings.
+    caplog.clear()
+    reader = PdfReader(BytesIO(data))
+    assert len(reader.pages) == 1
+    assert caplog.messages == []
+
+
 @pytest.mark.enable_socket
 def test_issue2886(caplog):
     """Tests for #2886"""
@@ -2099,7 +2439,9 @@ def test_issue2886(caplog):
     name = "issue2886.pdf"
 
     # Actual: 100_067
+    # Mock stream size, as xref table is broken: Declared size 200597 exceeds allowed limit of 25000!
     with mock.patch("pypdf.generic._base.NumberObject._LENGTH_LIMIT", 200_000), \
+            mock.patch("pypdf._reader.get_stream_size", return_value=5_000_000), \
             pytest.raises(PdfReadError, match=r"Unexpected empty line in Xref table\."):
         _ = PdfReader(BytesIO(get_data_from_url(url=url, name=name)))
 
@@ -2176,6 +2518,19 @@ def test_read_standard_xref_table__entry_invalid_but_object_found(caplog):
     reader = PdfReader(BytesIO(data))
     assert len(reader.pages) == 1
     assert "entry 1 in Xref table invalid but object found" in caplog.text
+
+
+def test_read_standard_xref_table__size_limit() -> None:
+    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
+
+    with pytest.raises(expected_exception=LimitReachedError, match=r"^Declared size 13 exceeds allowed limit of 5!$"):
+        reader._read_standard_xref_table(BytesIO(b"ref\n0 13\n" + b"a" * 100))
+
+    with pytest.raises(
+            expected_exception=PdfReadError,
+            match=r"^Invalid Elementary Object starting with b'a' @101: b'aaaaaaaaaaaaaaaaaaaaaaaaaaa'$"
+    ):
+        reader._read_standard_xref_table(BytesIO(b"ref\n0 5\n" + b"a" * 100))
 
 
 @pytest.mark.enable_socket
@@ -2570,6 +2925,27 @@ def test_read_pdf15_xref_stream__size_limit(caplog):
 @pytest.mark.timeout(10)
 def test_get_object_from_stream__size_limit(caplog):
     obj_stm_encoded = FlateDecode.encode(b"4 0\nnull")
+    pdf = _build_pdf_with_object_stream(b"/N 5000000 /First 4 /Filter /FlateDecode", obj_stm_encoded)
+
+    with pytest.raises(LimitReachedError, match=r"^Value /N 5000000 for object 3 exceeds maximum allowed value 2\.$"):
+        reader = PdfReader(BytesIO(pdf), strict=True)
+        _ = reader.pages[0]
+    assert caplog.messages == []
+
+    # The only /Kids entry cannot be read from the object stream and resolves to
+    # null, so it is dropped from the page tree and no page remains.
+    with pytest.raises(IndexError, match=r"^Sequence index out of range$"):
+        reader = PdfReader(BytesIO(pdf), strict=False)
+        _ = reader.pages[0]
+    assert caplog.messages == [
+        "Value /N 5000000 for object 3 exceeds maximum allowed value 2. Limiting to 2.",
+        "NumberObject(b'') invalid; use 0 instead",
+        "NumberObject(b'') invalid; use 0 instead",
+    ]
+
+
+def _build_pdf_with_object_stream(obj_stm_dict: bytes, obj_stm_payload: bytes) -> bytes:
+    """Build a minimal PDF whose only page (object 4) lives in object stream 3."""
     pdf = b"%PDF-1.7\n"
     header_length = len(pdf)
     pdf += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
@@ -2577,10 +2953,10 @@ def test_get_object_from_stream__size_limit(caplog):
     pdf += b"2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n"
     pages_length = len(pdf)
     pdf += (
-        f"3 0 obj\n<< /Type /ObjStm /N 5000000 /First 4 /Filter /FlateDecode /Length {len(obj_stm_encoded)} >>\n"
-        f"stream\n"
-    ).encode()
-    pdf += obj_stm_encoded + b"\nendstream\nendobj\n"
+        b"3 0 obj\n<< /Type /ObjStm " + obj_stm_dict
+        + b" /Length " + str(len(obj_stm_payload)).encode() + b" >>\nstream\n"
+        + obj_stm_payload + b"\nendstream\nendobj\n"
+    )
     xref = bytearray()
     for xref_type, value, generation in [
             (0, 0, 0),
@@ -2590,9 +2966,6 @@ def test_get_object_from_stream__size_limit(caplog):
             (2, 3, 0)
     ]:
         # xref type: 0 = free object, 1 = in-use object (points to byte offset), 2 = compressed (stored in stream)
-        # value: type 1 = byte offset in the file, type 2 = object stream number
-        # >B = 1 byte (unsigned char) for type and generation
-        # >H = 2 bytes (unsigned short) for value
         xref += struct.pack(">B", xref_type) + struct.pack(">H", value) + struct.pack(">B", generation)
     xref_encoded = FlateDecode.encode(bytes(xref))
     startxref = len(pdf)
@@ -2602,20 +2975,53 @@ def test_get_object_from_stream__size_limit(caplog):
     ).encode()
     pdf += xref_encoded + b"\nendstream\nendobj\n"
     pdf += f"startxref\n{startxref}\n%%EOF\n".encode()
+    return pdf
 
-    with pytest.raises(LimitReachedError, match=r"^Value /N 5000000 for object 3 exceeds maximum allowed value 2\.$"):
+
+@pytest.mark.parametrize(
+    ("obj_stm_dict", "obj_stm_payload", "match"),
+    [
+        (
+            b"/N 1 /First -1",
+            b"4 0\n<< /Type /Page /MediaBox [0 0 10 10] /Parent 2 0 R >>",
+            r"^Invalid /N \(1\) or /First \(-1\) in object stream 3\.$",
+        ),
+        (
+            b"/N -1 /First 4",
+            b"4 0\n<< /Type /Page /MediaBox [0 0 10 10] /Parent 2 0 R >>",
+            r"^Invalid /N \(-1\) or /First \(4\) in object stream 3\.$",
+        ),
+        (
+            b"/N 1 /First 5",
+            b"4 -1\n<< /Type /Page /MediaBox [0 0 10 10] /Parent 2 0 R >>",
+            r"^Invalid object number \(4\) or offset \(-1\) in object stream 3\.$",
+        ),
+        (
+            b"/N 1 /First 999999999999999999999999999999999999",
+            b"4 0\n<< /Type /Page /MediaBox [0 0 10 10] /Parent 2 0 R >>",
+            r"^Invalid /N \(1\) or /First \(999999999999999999999999999999999999\) in object stream 3\.$",
+        ),
+    ],
+    ids=["negative_first", "negative_n", "negative_entry_offset", "huge_first"],
+)
+def test_get_object_from_stream__invalid_values(obj_stm_dict, obj_stm_payload, match, caplog):
+    """Out-of-range /N, /First or header offsets are rejected, not a ValueError
+    or OverflowError from a bad seek.
+    """
+    pdf = _build_pdf_with_object_stream(obj_stm_dict, obj_stm_payload)
+
+    with pytest.raises(PdfReadError, match=match):
         reader = PdfReader(BytesIO(pdf), strict=True)
         _ = reader.pages[0]
     assert caplog.messages == []
 
-    with pytest.raises(PdfReadError, match=r"cyclic page references|Maximum recursion depth"):
-        reader = PdfReader(BytesIO(pdf), strict=False)
-        _ = reader.pages[0]
-    assert caplog.messages == [
-        "Value /N 5000000 for object 3 exceeds maximum allowed value 2. Limiting to 2.",
-        "NumberObject(b'') invalid; use 0 instead",
-        "NumberObject(b'') invalid; use 0 instead",
-    ]
+    # In non-strict mode the stream (or entry) is ignored with a warning; the
+    # only page cannot be resolved and is dropped from the page tree, exactly
+    # like an oversized /N.
+    reader = PdfReader(BytesIO(pdf), strict=False)
+    assert len(reader.pages) == 0
+    assert len(caplog.messages) >= 1
+    assert "Invalid" in caplog.messages[0]
 
 
 def test_named_destinations_cache():
@@ -2817,3 +3223,247 @@ def test_rebuild_xref_table__object_stream__long_offset():
         match=rf"Token exceeds maximum length of {IndirectObject._MAXIMUM_PART_LENGTH} bytes",
     ):
         reader._rebuild_xref_table(BytesIO(pdf))
+
+
+@pytest.mark.parametrize(
+    ("xref_obj_stm", "root_object", "expected_message"),
+    [
+        (
+            {
+                5: 5,
+            },
+            5,
+            r"^Circular object-stream reference detected: 5 -> 5$",
+        ),
+        (
+            {
+                5: 6,
+                6: 5,
+            },
+            5,
+            r"^Circular object-stream reference detected: 5 -> 6 -> 5$",
+        ),
+        (
+            {
+                5: 6,
+                6: 7,
+                7: 5,
+            },
+            5,
+            r"^Circular object-stream reference detected: 5 -> 6 -> 7 -> 5$",
+        ),
+        (
+            {
+                5: 6,
+                6: 7,
+                7: 8,
+                8: 9,
+                9: 5,
+            },
+            5,
+            r"^Circular object-stream reference detected: 5 -> 6 -> 7 -> 8 -> 9 -> 5$",
+        ),
+    ],
+    ids=["direct", "intermediate-1", "intermediate-2", "intermediate-4"]
+)
+def test_get_object_from_stream__circular_reference(
+        xref_obj_stm: dict[int, int],
+        root_object: int,
+        expected_message: str,
+) -> None:
+    def xref_entry(kind: int, field2: int, field3: int) -> bytes:
+        """Encode one entry for /W [1 4 2]."""
+        return (
+            bytes([kind])
+            + field2.to_bytes(4, "big")
+            + field3.to_bytes(2, "big")
+        )
+
+    # Objects needed by the xref stream:
+    #
+    #   0 = free
+    #   1..4 = free
+    #   5..N = compressed objects
+    #   N+1 = actual xref stream
+    #
+    # The xref stream itself is object `xref_object`.
+    max_object = max(*xref_obj_stm, *xref_obj_stm.values())
+    xref_object = max_object + 1
+    size = xref_object + 1
+
+    header = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n"
+    xref_offset = len(header)
+
+    entries = [
+        # object 0: free
+        xref_entry(0, 0, 65535),
+    ]
+
+    # objects 1 .. xref_object - 1
+    for object_id in range(1, xref_object):
+        if object_id in xref_obj_stm:
+            # TYPE 2:
+            #
+            # field2 = object-stream number
+            # field3 = index within that object stream
+            entries.append(
+                xref_entry(2, xref_obj_stm[object_id], 0)
+            )
+        else:
+            entries.append(xref_entry(0, 0, 0))
+
+    # xref stream itself: TYPE 1
+    entries.append(xref_entry(1, xref_offset, 0))
+
+    entries = b"".join(entries)
+
+    dictionary = (
+        f"{xref_object} 0 obj\n".encode("ascii")
+        + b"<<\n"
+        + b"/Type /XRef\n"
+        + f"/Size {size}\n".encode("ascii")
+        + b"/W [1 4 2]\n"
+        + f"/Index [0 {size}]\n".encode("ascii")
+        + f"/Root {root_object} 0 R\n".encode("ascii")
+        + b"/Length "
+        + str(len(entries)).encode("ascii")
+        + b"\n"
+        + b">>\n"
+        + b"stream\n"
+    )
+
+    data = (
+        header
+        + dictionary
+        + entries
+        + b"endstream\n"
+        + b"endobj\n"
+        + b"startxref\n"
+        + str(xref_offset).encode("ascii")
+        + b"\n"
+        + b"%%EOF\n"
+    )
+
+    reader = PdfReader(BytesIO(data))
+    with pytest.raises(expected_exception=PdfReadError, match=expected_message):
+        _ = list(reader.pages)
+
+
+def test_get_object_from_stream__read_object_raises_and_warns(caplog):
+    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
+    reader.strict = False
+    reader._object_stream_resolution_stack = []
+    reader.xref_objStm = {1: (5, 0)}
+
+    # Object stream containing one object: object 1 at offset 0.
+    obj_stm = StreamObject()
+    obj_stm[NameObject("/Type")] = NameObject("/ObjStm")
+    obj_stm[NameObject("/N")] = NumberObject(1)
+    obj_stm[NameObject("/First")] = NumberObject(0)
+    obj_stm.set_data(b"1 0")
+
+    cached = {}
+
+    def cache_indirect_object(generation: int, idnum: int, obj: PdfObject) -> None:
+        cached[(generation, idnum)] = obj
+
+    exc = PdfStreamError("malformed stream")
+    with mock.patch.object(reader, "get_object", return_value=obj_stm), \
+            mock.patch.object(reader, "cache_get_indirect_object", return_value=None), \
+            mock.patch.object(reader, "cache_indirect_object", side_effect=cache_indirect_object), \
+            mock.patch("pypdf._reader.read_object", side_effect=lambda *_: (_ for _ in ()).throw(exc)):
+        result = reader._get_object_from_stream(IndirectObject(1, 0, reader))
+
+    assert isinstance(result, NullObject)
+    assert cached[(0, 1)] is result
+    assert "Invalid stream (index 0) within object 1 0: malformed stream" in caplog.text
+    assert reader._object_stream_resolution_stack == []
+
+
+@pytest.mark.timeout(5)
+def test_read_standard_xref_table__end_of_file():
+    body = b"%PDF-1.0\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\n"
+    tail = b"\nstartxref\n%d\n%%%%EOF" % len(body)  # 19 bytes, starts with LF
+    data = body + b"xref\n0 3\n0000000000 65535 f \n" + tail
+
+    with pytest.raises(expected_exception=PdfReadError, match=r"^Unexpected EOF in Xref table\.$"):
+        PdfReader(BytesIO(data))
+
+
+def _build_objstm_pdf(n_value, first_value=b"4") -> bytes:
+    """One page in an object stream (obj 4); xref is a stream (obj 5).
+
+    n_value and first_value are raw header entries (None = omitted).
+    """
+    objects = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    }
+    inner = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"
+    header = b"3 0 "
+    n_entry = b"" if n_value is None else b" /N " + n_value
+    first_entry = b"" if first_value is None else b" /First " + first_value
+    stream_data = header + inner
+    head4 = b"<< /Type /ObjStm" + n_entry + first_entry + b" /Length %d >>\nstream\n"
+    objects[4] = head4 % len(stream_data) + stream_data + b"\nendstream"
+    out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for num in sorted(objects):
+        offsets[num] = len(out)
+        out += b"%d 0 obj\n" % num + objects[num] + b"\nendobj\n"
+    xref_offset = len(out)
+    entries = bytearray()
+    entries += bytes([0]) + (0).to_bytes(4, "big") + (65535).to_bytes(2, "big")
+    for num in (1, 2):
+        entries += bytes([1]) + offsets[num].to_bytes(4, "big") + (0).to_bytes(2, "big")
+    entries += bytes([2]) + (4).to_bytes(4, "big") + (0).to_bytes(2, "big")
+    entries += bytes([1]) + offsets[4].to_bytes(4, "big") + (0).to_bytes(2, "big")
+    entries += bytes([1]) + xref_offset.to_bytes(4, "big") + (0).to_bytes(2, "big")
+    objects[5] = (
+        b"<< /Type /XRef /Size 6 /Root 1 0 R /W [1 4 2] /Index [0 6] "
+        b"/Length %d >>\nstream\n" % len(entries) + bytes(entries) + b"\nendstream"
+    )
+    out += b"5 0 obj\n" + objects[5] + b"\nendobj\n"
+    out += b"startxref\n%d\n%%%%EOF\n" % xref_offset
+    return bytes(out)
+
+
+def test_issue4215__valid_objstm_still_resolves():
+    page = PdfReader(BytesIO(_build_objstm_pdf(b"1"))).pages[0]
+    assert page is not None
+
+
+@pytest.mark.parametrize("n_value", [b"/Foo", b"<< /a 1 >>", b"[1 2]", None])
+def test_issue4215__malformed_n_raises_pdfreaderror(n_value):
+    with pytest.raises(PdfReadError, match="Invalid /ObjStm header"):
+        PdfReader(BytesIO(_build_objstm_pdf(n_value))).pages[0]
+
+
+@pytest.mark.parametrize("first_value", [b"/Foo", None])
+def test_issue4215__malformed_first_raises_pdfreaderror(first_value):
+    with pytest.raises(PdfReadError, match="Invalid /ObjStm header"):
+        PdfReader(BytesIO(_build_objstm_pdf(b"1", first_value))).pages[0]
+
+
+@pytest.mark.timeout(5)  # Previously: About 25 seconds.
+def test_get_object__speed__repeated_invalid_lookups_for_same_object() -> None:
+    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
+    for _ in range(30_000):
+        assert reader.get_object(9999) is None
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(15)  # Previously: About 25 seconds.
+def test_read_standard_xref_table__speed__caching() -> None:
+    entries = 80_000
+    body = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    body += b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+    body += b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"
+    xref_off = len(body)
+    body += b"xref\n"
+    body += b"0 %d\n" % entries
+    body += b"x" * 20 * entries
+    body += b"trailer\n<< /Root 1 0 R /Size 3 >>\nstartxref\n%d\n%%%%EOF\n" % xref_off
+
+    reader = PdfReader(BytesIO(body))
+    _ = len(reader.pages)
